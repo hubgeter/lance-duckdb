@@ -1,7 +1,5 @@
 #include "lance_filter_ir.hpp"
 
-#include "lance_common.hpp"
-#include "lance_expr_ir.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
@@ -13,12 +11,14 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "lance_common.hpp"
+#include "lance_expr_ir.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -26,6 +26,13 @@
 namespace duckdb {
 
 bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
+  // DuckDB orders NaN above every finite floating-point value and considers
+  // NaN equal to itself. Arrow/DataFusion comparisons use IEEE semantics, so
+  // pushing any FLOAT/DOUBLE predicate can irreversibly discard rows before
+  // DuckDB gets a chance to apply its own comparison rules.
+  if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+    return false;
+  }
   return LanceExprIRSupportsLogicalType(type);
 }
 

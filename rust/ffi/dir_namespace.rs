@@ -96,6 +96,7 @@ fn dir_namespace_list_tables_inner(
     Ok(tables)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dir_namespace_list_tables(
     root: *const c_char,
@@ -186,6 +187,7 @@ fn open_dataset_in_dir_namespace_inner(
     Ok((DatasetHandle::new(Arc::new(dataset)), table_uri))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
     root: *const c_char,
@@ -226,6 +228,7 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace_with_session(
     root: *const c_char,
@@ -305,6 +308,7 @@ fn dir_namespace_drop_table_inner(
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dir_namespace_drop_table(
     root: *const c_char,

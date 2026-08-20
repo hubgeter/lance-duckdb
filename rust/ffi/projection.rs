@@ -1,13 +1,46 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
+use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::constants::{DISTANCE_COLUMN, HYBRID_SCORE_COLUMN, SCORE_COLUMN};
+
+fn field_path_segment_needs_quoting(segment: &str) -> bool {
+    segment.is_empty()
+        || segment
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+}
+
+fn format_top_level_field_path(name: &str) -> String {
+    if !field_path_segment_needs_quoting(name) {
+        return name.to_string();
+    }
+    format!("`{}`", name.replace('`', "``"))
+}
+
+pub(crate) fn format_projection_columns<'a>(
+    columns: impl IntoIterator<Item = &'a str>,
+    schema: &LanceSchema,
+) -> Vec<String> {
+    columns
+        .into_iter()
+        .map(|column| {
+            if schema.fields.iter().any(|field| field.name == column) {
+                format_top_level_field_path(column)
+            } else {
+                // Nested paths and virtual columns already use Lance field-path
+                // syntax and must not be quoted as one top-level name.
+                column.to_string()
+            }
+        })
+        .collect()
+}
 
 pub(crate) fn build_base_projection(schema: &Schema) -> Arc<[String]> {
     let mut cols = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        cols.push(field.name().to_string());
+        cols.push(format_top_level_field_path(field.name()));
     }
     cols.into()
 }

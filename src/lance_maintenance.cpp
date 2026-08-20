@@ -137,6 +137,9 @@ LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
       "__lance_maintenance");
   string input_str =
       input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance maintenance");
+  }
 
   string options_json;
   string index_name;
@@ -358,6 +361,9 @@ LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
       "__lance_set_auto_cleanup");
   string input_str =
       input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance auto-cleanup configuration");
+  }
 
   bool unset = false;
   if (!input.inputs[4].IsNull()) {
@@ -1027,6 +1033,58 @@ static bool TryParseIdentifier(const string &sql, string &out_ident,
   return true;
 }
 
+static bool TryParseQualifiedIdentifier(const string &sql, string &out_sql,
+                                        idx_t &out_consumed) {
+  out_sql.clear();
+  out_consumed = 0;
+  idx_t i = 0;
+  bool saw_part = false;
+  while (i < sql.size()) {
+    if (sql[i] == '"') {
+      i++;
+      bool closed = false;
+      while (i < sql.size()) {
+        if (sql[i] != '"') {
+          i++;
+          continue;
+        }
+        if (i + 1 < sql.size() && sql[i + 1] == '"') {
+          i += 2;
+          continue;
+        }
+        i++;
+        closed = true;
+        break;
+      }
+      if (!closed) {
+        return false;
+      }
+    } else {
+      auto start = i;
+      while (i < sql.size() && sql[i] != '.' && IsIdentChar(sql[i])) {
+        i++;
+      }
+      if (i == start) {
+        return false;
+      }
+    }
+    saw_part = true;
+    if (i >= sql.size() || sql[i] != '.') {
+      break;
+    }
+    i++;
+    if (i >= sql.size()) {
+      return false;
+    }
+  }
+  if (!saw_part) {
+    return false;
+  }
+  out_sql = sql.substr(0, i);
+  out_consumed = i;
+  return true;
+}
+
 struct LanceMaintenanceParseData final : public ParserExtensionParseData {
   explicit LanceMaintenanceParseData(LanceMaintenanceStmtKind kind_p)
       : kind(kind_p) {}
@@ -1100,7 +1158,7 @@ static bool TryParseTarget(string &rest, bool &target_is_path,
   }
 
   string ident;
-  if (!TryParseIdentifier(rest, ident, consumed)) {
+  if (!TryParseQualifiedIdentifier(rest, ident, consumed)) {
     out_error = "expected dataset path or table identifier";
     return false;
   }
@@ -1317,7 +1375,7 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
 
   string target;
   if (parse_data->target_is_path) {
-    target = parse_data->dataset_uri;
+    target = "path:" + parse_data->dataset_uri;
   } else {
     auto qname = QualifiedName::Parse(parse_data->target_sql);
     if (qname.catalog.empty()) {
@@ -1326,7 +1384,11 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     if (qname.schema.empty()) {
       qname.schema = DEFAULT_SCHEMA;
     }
-    target = qname.catalog + "." + qname.schema + "." + qname.name;
+    // Preserve the parser's path-vs-table decision and re-quote every
+    // component. Otherwise a catalog or table name containing '.' is
+    // reinterpreted as extra qualification (or, after resolution fails, as a
+    // filesystem path) by the internal maintenance table function.
+    target = "table:" + qname.ToString();
   }
 
   ParserExtensionPlanResult result;

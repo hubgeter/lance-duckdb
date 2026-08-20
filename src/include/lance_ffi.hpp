@@ -62,6 +62,9 @@ int32_t lance_namespace_describe_table(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
     const char **out_location, const char **out_storage_options_tsv);
+uint64_t lance_namespace_get_table_version(
+    const char *endpoint, const char *table_id, const char *bearer_token,
+    const char *api_key, const char *delimiter, const char *headers_tsv);
 int32_t lance_namespace_create_empty_table(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
@@ -80,6 +83,9 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
+uint64_t lance_dataset_version(void *dataset);
+const char *lance_dataset_generation_id(void *dataset);
+void *lance_dataset_checkout_version(void *dataset, uint64_t version);
 
 void *lance_get_schema(void *dataset);
 void *lance_get_schema_for_scan(void *dataset);
@@ -204,21 +210,47 @@ void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
-    const char *data_storage_version, void *session, const ArrowSchema *schema);
+    const char *data_storage_version, const char *vector_dims,
+    uint8_t infer_vector_dims, void *session, const ArrowSchema *schema);
 void *lance_open_uncommitted_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
-    const char *data_storage_version, void *session, const ArrowSchema *schema);
+    const char *data_storage_version, const char *vector_dims,
+    uint8_t infer_vector_dims, void *session, const ArrowSchema *schema);
 int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
 int32_t lance_writer_finish(void *writer);
 int32_t lance_writer_finish_uncommitted(void *writer, void **out_transaction);
 void lance_close_writer(void *writer);
 
+int32_t lance_serialize_transaction(void *transaction, uint8_t **out_data,
+                                    size_t *out_len);
+void lance_free_bytes(uint8_t *data, size_t len);
+
+int32_t lance_distributed_write_validate(const char *path, const char *mode,
+                                         const char **option_keys,
+                                         const char **option_values,
+                                         size_t options_len, void *session,
+                                         const char *operation_id);
+int32_t lance_distributed_write_commit(
+    const char *path, const char *mode, const char **option_keys,
+    const char **option_values, size_t options_len, void *session,
+    const char *operation_id, const char **task_attempt_ids,
+    const uint8_t **transaction_data, const size_t *transaction_lens,
+    size_t transaction_count, uint64_t selected_rows, uint64_t *out_rows);
+int32_t lance_distributed_write_abort(const char *path,
+                                      const char **option_keys,
+                                      const char **option_values,
+                                      size_t options_len, void *session,
+                                      const char *operation_id);
+
 int32_t lance_commit_transaction_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session, void *transaction);
 void lance_free_transaction(void *transaction);
+int32_t lance_abort_transaction_with_storage_options(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *session, void *transaction);
 
 int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
     const char *path, const char **option_keys, const char **option_values,
@@ -231,11 +263,17 @@ int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
 int32_t lance_merge_begin_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, uint64_t max_rows_per_file, uint64_t max_rows_per_group,
-    uint64_t max_bytes_per_file, void *session, void **out_merge_handle);
+    uint64_t max_bytes_per_file, void *session, uint64_t dataset_version,
+    void **out_merge_handle);
 int32_t lance_merge_add_delete_rowids(void *merge_handle,
                                       const uint64_t *row_ids,
                                       size_t row_ids_len);
 int32_t lance_merge_add_insert_batch(void *merge_handle, void *array);
+int32_t lance_merge_add_update_batch(void *merge_handle, void *array,
+                                     const uint64_t *row_ids,
+                                     size_t row_ids_len,
+                                     const char **modified_columns,
+                                     size_t modified_columns_len);
 int32_t lance_merge_finish_uncommitted(void *merge_handle,
                                        void **out_transaction);
 void lance_merge_abort(void *merge_handle);
@@ -255,7 +293,8 @@ void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  uint64_t k, uint64_t nprobes,
                                  uint64_t refine_factor,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter, uint8_t use_index);
+                                 const char *filter_sql, uint8_t prefilter,
+                                 uint8_t use_index);
 
 const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
                                       const float *query_values,
@@ -270,7 +309,7 @@ void *lance_get_fts_schema(void *dataset, const char *text_column,
 void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char *query, uint64_t k,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter);
+                                 const char *filter_sql, uint8_t prefilter);
 
 typedef struct LanceNamespaceQueryConfig {
   uint8_t namespace_kind;
@@ -286,7 +325,10 @@ typedef struct LanceNamespaceQueryConfig {
   const char *headers_tsv;
   const char **columns;
   size_t columns_len;
+  const char **expected_columns;
+  size_t expected_columns_len;
   const char *filter;
+  uint64_t dataset_version;
   uint64_t k;
   uint8_t prefilter;
 } LanceNamespaceQueryConfig;

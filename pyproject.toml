@@ -1,7 +1,7 @@
 [project]
 name = "lance-duckdb-devtools"
 version = "0.1.0"
-description = "Developer tooling for DuckDB format.py"
+description = "Developer formatting tools for Vane's Lance extension"
 requires-python = ">=3.11"
 dependencies = []
 

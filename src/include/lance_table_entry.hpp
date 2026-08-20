@@ -25,6 +25,7 @@ struct LanceNamespaceTableConfig {
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+  string replay_secret_name;
   string display_uri;
 
   bool IsDirectory() const { return kind == LanceNamespaceKind::Directory; }

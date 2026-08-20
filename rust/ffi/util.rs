@@ -79,6 +79,16 @@ pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> 
     Ok(s)
 }
 
+pub(crate) unsafe fn optional_cstr_to_string(
+    ptr: *const c_char,
+    what: &'static str,
+) -> FfiResult<Option<String>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(unsafe { cstr_to_str(ptr, what)? }.to_string()))
+}
+
 pub(crate) unsafe fn slice_from_ptr<'a, T>(
     ptr: *const T,
     len: usize,

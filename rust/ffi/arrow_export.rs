@@ -13,6 +13,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use super::types::SchemaHandle;
 use super::util::{batch_handle, schema_handle, schema_to_ffi_arrow_schema, FfiError, FfiResult};
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_schema(schema: *mut c_void) {
     if !schema.is_null() {
@@ -22,6 +23,7 @@ pub unsafe extern "C" fn lance_free_schema(schema: *mut c_void) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_schema_to_arrow(
     schema: *mut c_void,
@@ -54,6 +56,7 @@ fn schema_to_arrow_inner(schema: *mut c_void, out_schema: *mut FFI_ArrowSchema) 
     Ok(())
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_batch(batch: *mut c_void) {
     if !batch.is_null() {
@@ -63,6 +66,7 @@ pub unsafe extern "C" fn lance_free_batch(batch: *mut c_void) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_batch_to_arrow(
     batch: *mut c_void,

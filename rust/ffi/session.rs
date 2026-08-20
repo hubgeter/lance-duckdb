@@ -43,6 +43,7 @@ pub(crate) fn record_commit() {
     COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_session(
     index_cache_size_bytes: u64,
@@ -95,6 +96,7 @@ fn clear_session_caches(handle: &SessionHandle) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_session(session: *mut c_void) {
     if !session.is_null() {
@@ -103,6 +105,7 @@ pub unsafe extern "C" fn lance_close_session(session: *mut c_void) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_session_get_stats(
     session: *mut c_void,
@@ -141,6 +144,7 @@ fn session_get_stats_inner(session: *mut c_void) -> FfiResult<LanceSessionStats>
     })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_debug_get_counters(out_counters: *mut LanceDebugCounters) -> i32 {
     if out_counters.is_null() {
@@ -160,6 +164,7 @@ pub unsafe extern "C" fn lance_debug_get_counters(out_counters: *mut LanceDebugC
     0
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_debug_reset_counters() {
     DATASET_OPEN_COUNT.store(0, Ordering::Relaxed);

@@ -12,13 +12,17 @@ Charlie
 Alice
 Eve
 
-# Duplicate row ids: output preserves duplicates
+# Duplicate row ids have predicate set semantics.
 query T
 SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (1, 1, 3)
 ----
 Bob
-Bob
 David
+
+query I
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE _rowid = 1 OR _rowid = 1
+----
+1
 
 # Non-existent row ids: missing ids are ignored
 query T
@@ -26,3 +30,20 @@ SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 999, 4)
 ----
 Alice
 Eve
+
+# Non-stable row ids encode the fragment id in the high 32 bits
+statement ok
+COPY (
+  SELECT range::BIGINT AS id
+  FROM range(6)
+) TO 'test/.tmp/scan_rowid_in_fragments.lance'
+  (FORMAT lance, mode 'overwrite', max_rows_per_file 2);
+
+query I
+SELECT id
+FROM 'test/.tmp/scan_rowid_in_fragments.lance'
+WHERE _rowid IN (4294967296, 8589934592)
+ORDER BY id
+----
+2
+4

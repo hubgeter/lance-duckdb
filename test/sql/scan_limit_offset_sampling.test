@@ -45,3 +45,28 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
 statement ok
 SELECT count(*) FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (100 PERCENT);
 
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(100) source(i))
+TO 'test/.tmp/repeatable_sample.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+WITH lhs AS (
+  SELECT id FROM 'test/.tmp/repeatable_sample.lance'
+  TABLESAMPLE SYSTEM (25 PERCENT) REPEATABLE (42)
+), rhs AS (
+  SELECT id FROM 'test/.tmp/repeatable_sample.lance'
+  TABLESAMPLE SYSTEM (25 PERCENT) REPEATABLE (42)
+), differences AS (
+  (SELECT * FROM lhs EXCEPT SELECT * FROM rhs)
+  UNION ALL
+  (SELECT * FROM rhs EXCEPT SELECT * FROM lhs)
+)
+SELECT count(*) FROM differences;
+----
+0
+
+query I
+SELECT count(*) FROM 'test/.tmp/repeatable_sample.lance'
+TABLESAMPLE SYSTEM (25 PERCENT) REPEATABLE (42);
+----
+25

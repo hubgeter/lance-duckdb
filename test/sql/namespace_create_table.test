@@ -109,6 +109,15 @@ attach_create_table_seed
 attach_create_table_with_version
 
 statement ok
+CREATE TABLE ns.main.attach_create_table_ctas_after_show AS
+  SELECT 42::BIGINT AS id;
+
+query I
+SELECT id FROM ns.main.attach_create_table_ctas_after_show
+----
+42
+
+statement ok
 CREATE TABLE ns.main.attach_create_table_after_show (id BIGINT);
 
 statement ok

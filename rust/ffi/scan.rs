@@ -6,6 +6,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
+use super::projection;
 use super::types::StreamHandle;
 use super::util::{
     optional_cstr_array, parse_optional_filter_ir, to_c_string, u64_to_usize, FfiError, FfiResult,
@@ -16,6 +17,7 @@ use rand::rngs::StdRng;
 use rand::seq::index::sample;
 use rand::SeedableRng;
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_fragment_stream_ir(
     dataset: *mut c_void,
@@ -68,6 +70,10 @@ fn create_fragment_stream_ir_inner(
     let mut scan = fragment.scan();
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    let projection = projection::format_projection_columns(
+        projection.iter().map(String::as_str),
+        handle.dataset.schema(),
+    );
     if !projection.is_empty() {
         if projection.iter().any(|c| c == ROW_ID_COLUMN) {
             scan.with_row_id();
@@ -98,6 +104,7 @@ fn create_fragment_stream_ir_inner(
     Ok(StreamHandle::Lance(stream))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_dataset_stream_ir(
     dataset: *mut c_void,
@@ -155,6 +162,10 @@ fn create_dataset_stream_ir_inner(
     let mut scan = handle.dataset.scan();
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    let projection = projection::format_projection_columns(
+        projection.iter().map(String::as_str),
+        handle.dataset.schema(),
+    );
     if !projection.is_empty() {
         if projection.iter().any(|c| c == ROW_ID_COLUMN) {
             scan.with_row_id();
@@ -193,6 +204,7 @@ fn create_dataset_stream_ir_inner(
     Ok(StreamHandle::Lance(stream))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_dataset_sample_stream_ir(
     dataset: *mut c_void,
@@ -227,7 +239,7 @@ fn create_dataset_sample_stream_ir_inner(
     columns_len: usize,
     sample_percentage: f64,
     seed: i64,
-    _repeatable: u8,
+    repeatable: u8,
 ) -> FfiResult<StreamHandle> {
     const DEFAULT_TAKE_BATCH_SIZE: usize = 8192;
 
@@ -263,6 +275,10 @@ fn create_dataset_sample_stream_ir_inner(
     }
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    let projection = projection::format_projection_columns(
+        projection.iter().map(String::as_str),
+        handle.dataset.schema(),
+    );
     let dataset_schema = handle.dataset.schema();
     let projection = if projection.is_empty() {
         ProjectionRequest::from_schema(dataset_schema.clone())
@@ -273,7 +289,13 @@ fn create_dataset_sample_stream_ir_inner(
     let row_indices: Vec<u64> = if target == total_rows {
         (0..total_rows as u64).collect()
     } else {
-        let mut rng = if seed >= 0 {
+        if repeatable != 0 && seed < 0 {
+            return Err(FfiError::new(
+                ErrorCode::DatasetScan,
+                "repeatable sampling requires a non-negative seed".to_string(),
+            ));
+        }
+        let mut rng = if repeatable != 0 || seed >= 0 {
             StdRng::seed_from_u64(seed as u64)
         } else {
             StdRng::from_entropy()
@@ -295,6 +317,7 @@ fn create_dataset_sample_stream_ir_inner(
     Ok(StreamHandle::Take(stream))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_explain_dataset_scan_ir(
     dataset: *mut c_void,
@@ -342,6 +365,10 @@ fn explain_dataset_scan_ir_inner(
     let mut scan = handle.dataset.scan();
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    let projection = projection::format_projection_columns(
+        projection.iter().map(String::as_str),
+        handle.dataset.schema(),
+    );
     if !projection.is_empty() {
         scan.project(&projection).map_err(|err| {
             FfiError::new(

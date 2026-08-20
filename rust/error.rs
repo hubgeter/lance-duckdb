@@ -1,5 +1,7 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::ffi::{c_char, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 #[repr(i32)]
@@ -67,6 +69,7 @@ pub enum ErrorCode {
     Exec = 52,
     DatasetMerge = 53,
     NamespaceQueryTable = 54,
+    DatasetCommitOutcomeUnknown = 55,
 }
 
 struct LastError {
@@ -100,11 +103,81 @@ pub fn set_last_error(code: ErrorCode, message: impl AsRef<str>) {
     });
 }
 
+pub trait FfiPanicReturn {
+    fn panic_value() -> Self;
+}
+
+impl FfiPanicReturn for () {
+    fn panic_value() -> Self {}
+}
+
+impl<T> FfiPanicReturn for *const T {
+    fn panic_value() -> Self {
+        ptr::null()
+    }
+}
+
+impl<T> FfiPanicReturn for *mut T {
+    fn panic_value() -> Self {
+        ptr::null_mut()
+    }
+}
+
+impl FfiPanicReturn for i32 {
+    fn panic_value() -> Self {
+        -1
+    }
+}
+
+impl FfiPanicReturn for i64 {
+    fn panic_value() -> Self {
+        -1
+    }
+}
+
+impl FfiPanicReturn for u64 {
+    fn panic_value() -> Self {
+        0
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+pub fn catch_ffi_panic<T, F>(function: F) -> T
+where
+    T: FfiPanicReturn,
+    F: FnOnce() -> T,
+{
+    match catch_unwind(AssertUnwindSafe(function)) {
+        Ok(value) => value,
+        Err(payload) => {
+            set_last_error(
+                ErrorCode::Runtime,
+                format!(
+                    "panic at Lance FFI boundary: {}",
+                    panic_message(payload.as_ref())
+                ),
+            );
+            T::panic_value()
+        }
+    }
+}
+
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub extern "C" fn lance_last_error_code() -> i32 {
     LAST_ERROR.with(|e| e.borrow().as_ref().map(|v| v.code).unwrap_or(0))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub extern "C" fn lance_last_error_message() -> *const c_char {
     LAST_ERROR.with(|e| match e.borrow_mut().take() {
@@ -113,11 +186,37 @@ pub extern "C" fn lance_last_error_message() -> *const c_char {
     })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_string(s: *const c_char) {
     if !s.is_null() {
         unsafe {
             let _ = CString::from_raw(s as *mut c_char);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    #[ffi_guard_macro::ffi_guard]
+    extern "C" fn ffi_panic_probe() -> i32 {
+        panic!("ffi panic probe");
+    }
+
+    #[test]
+    fn ffi_guard_converts_panics_to_last_error() {
+        assert_eq!(ffi_panic_probe(), -1);
+        assert_eq!(lance_last_error_code(), ErrorCode::Runtime as i32);
+
+        let message = lance_last_error_message();
+        assert!(!message.is_null());
+        let message_text = unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { lance_free_string(message) };
+        assert!(message_text.contains("panic at Lance FFI boundary: ffi panic probe"));
     }
 }

@@ -1,31 +1,26 @@
 #include "lance_common.hpp"
 
-#include "lance_ffi.hpp"
-#include "lance_session_state.hpp"
-#include "lance_table_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "lance_ffi.hpp"
+#include "lance_session_state.hpp"
+#include "lance_table_entry.hpp"
 
 #include <cstring>
 
 namespace duckdb {
 
-string LanceConsumeLastError() {
-  auto code = lance_last_error_code();
-  string message;
-  if (auto *ptr = lance_last_error_message()) {
-    message = ptr;
-    lance_free_string(ptr);
-  }
-
+string LanceLastError::ToString() const {
   if (code == 0 && message.empty()) {
     return "";
   }
@@ -36,6 +31,20 @@ string LanceConsumeLastError() {
     return message;
   }
   return message + " (code=" + to_string(code) + ")";
+}
+
+LanceLastError LanceConsumeLastErrorDetail() {
+  LanceLastError result;
+  result.code = lance_last_error_code();
+  if (auto *ptr = lance_last_error_message()) {
+    result.message = ptr;
+    lance_free_string(ptr);
+  }
+  return result;
+}
+
+string LanceConsumeLastError() {
+  return LanceConsumeLastErrorDetail().ToString();
 }
 
 string LanceFormatErrorSuffix() {
@@ -60,17 +69,20 @@ static void BuildStringPointerArray(const vector<string> &values,
 }
 
 void FillLanceNamespaceQueryConfig(
-    ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
-    bool prefilter, const string &filter, const vector<string> &columns,
+    ClientContext &context, const LanceNamespaceTableConfig &cfg,
+    uint64_t dataset_version, uint64_t k, bool prefilter, const string &filter,
+    const vector<string> &columns, vector<string> &resolved_option_keys,
+    vector<string> &resolved_option_values,
     vector<const char *> &option_key_ptrs,
     vector<const char *> &option_value_ptrs, vector<const char *> &column_ptrs,
-    string &bearer_token, string &api_key,
+    string &bearer_token, string &api_key, string &headers_tsv,
     LanceNamespaceQueryConfig &out_config) {
   static constexpr uint8_t NAMESPACE_KIND_DIRECTORY = 0;
   static constexpr uint8_t NAMESPACE_KIND_REST = 1;
 
   out_config = {};
   out_config.table_id = cfg.table_id.c_str();
+  out_config.dataset_version = dataset_version;
   out_config.k = k;
   out_config.prefilter = prefilter ? 1 : 0;
   out_config.filter = filter.empty() ? nullptr : filter.c_str();
@@ -78,12 +90,22 @@ void FillLanceNamespaceQueryConfig(
   BuildStringPointerArray(columns, column_ptrs);
   out_config.columns = column_ptrs.empty() ? nullptr : column_ptrs.data();
   out_config.columns_len = column_ptrs.size();
+  out_config.expected_columns = out_config.columns;
+  out_config.expected_columns_len = out_config.columns_len;
 
   if (cfg.IsDirectory()) {
     out_config.namespace_kind = NAMESPACE_KIND_DIRECTORY;
     out_config.root = cfg.root.c_str();
-    BuildStorageOptionPointerArrays(cfg.option_keys, cfg.option_values,
-                                    option_key_ptrs, option_value_ptrs);
+    resolved_option_keys = cfg.option_keys;
+    resolved_option_values = cfg.option_values;
+    if (resolved_option_keys.empty()) {
+      LanceFillStorageOptionsFromSecrets(
+          context, LanceDirectoryNamespaceDatasetUri(cfg), resolved_option_keys,
+          resolved_option_values);
+    }
+    BuildStorageOptionPointerArrays(resolved_option_keys,
+                                    resolved_option_values, option_key_ptrs,
+                                    option_value_ptrs);
     out_config.option_keys =
         option_key_ptrs.empty() ? nullptr : option_key_ptrs.data();
     out_config.option_values =
@@ -96,18 +118,9 @@ void FillLanceNamespaceQueryConfig(
   out_config.endpoint = cfg.endpoint.c_str();
   out_config.delimiter =
       cfg.delimiter.empty() ? nullptr : cfg.delimiter.c_str();
-  out_config.headers_tsv =
-      cfg.headers_tsv.empty() ? nullptr : cfg.headers_tsv.c_str();
-
-  unordered_map<string, Value> overrides;
-  if (!cfg.bearer_token_override.empty()) {
-    overrides["bearer_token"] = Value(cfg.bearer_token_override);
-  }
-  if (!cfg.api_key_override.empty()) {
-    overrides["api_key"] = Value(cfg.api_key_override);
-  }
-  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
-                            api_key);
+  ResolveLanceNamespaceTableAuth(context, cfg, bearer_token, api_key,
+                                 headers_tsv);
+  out_config.headers_tsv = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
   out_config.bearer_token =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   out_config.api_key = api_key.empty() ? nullptr : api_key.c_str();
@@ -121,6 +134,15 @@ string LanceNormalizeS3Scheme(const string &path) {
     return "s3://" + path.substr(6);
   }
   return path;
+}
+
+string LanceNormalizeDatasetPath(ClientContext &context, const string &path) {
+  auto result = LanceNormalizeS3Scheme(path);
+  if (result.find("://") == string::npos) {
+    auto &fs = FileSystem::GetFileSystem(context);
+    result = fs.CanonicalizePath(result);
+  }
+  return result;
 }
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg) {
@@ -263,6 +285,127 @@ void ResolveLanceNamespaceAuthOverrides(
   }
 }
 
+string RegisterLanceNamespaceReplaySecret(ClientContext &context,
+                                          const string &endpoint,
+                                          const string &bearer_token,
+                                          const string &api_key,
+                                          const string &headers_tsv) {
+  if (bearer_token.empty() && api_key.empty() && headers_tsv.empty()) {
+    return "";
+  }
+  auto secret_name = "__vane_lance_namespace_replay_" +
+                     UUID::ToString(UUID::GenerateRandomUUID());
+  auto secret = make_uniq<KeyValueSecret>(vector<string>{endpoint},
+                                          "lance_namespace_replay", "config",
+                                          secret_name);
+  auto add_value = [&](const string &key, const string &value) {
+    if (!value.empty()) {
+      secret->secret_map[key] = Value(value);
+      secret->redact_keys.insert(key);
+    }
+  };
+  add_value("bearer_token", bearer_token);
+  add_value("api_key", api_key);
+  add_value("headers_tsv", headers_tsv);
+
+  auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+  SecretManager::Get(context).RegisterSecret(
+      transaction, std::move(secret), OnCreateConflict::REPLACE_ON_CONFLICT,
+      SecretPersistType::TEMPORARY);
+  return secret_name;
+}
+
+string RegisterLanceStorageOptionsReplaySecret(
+    ClientContext &context, const string &scope,
+    const vector<string> &option_keys, const vector<string> &option_values) {
+  if (option_keys.empty()) {
+    return "";
+  }
+  if (option_keys.size() != option_values.size()) {
+    throw InternalException(
+        "Storage option keys/values size mismatch for Lance replay secret");
+  }
+  auto secret_name = "__vane_lance_storage_replay_" +
+                     UUID::ToString(UUID::GenerateRandomUUID());
+  auto secret = make_uniq<KeyValueSecret>(vector<string>{scope}, "lance",
+                                          "config", secret_name);
+  for (idx_t i = 0; i < option_keys.size(); i++) {
+    secret->secret_map[option_keys[i]] = Value(option_values[i]);
+    // Namespace-provided options may contain credentials under provider-
+    // specific names. Keep every replayed value out of diagnostics.
+    secret->redact_keys.insert(option_keys[i]);
+  }
+  auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+  SecretManager::Get(context).RegisterSecret(
+      transaction, std::move(secret), OnCreateConflict::REPLACE_ON_CONFLICT,
+      SecretPersistType::TEMPORARY);
+  return secret_name;
+}
+
+void ResolveLanceNamespaceTableAuth(ClientContext &context,
+                                    const LanceNamespaceTableConfig &cfg,
+                                    string &out_bearer_token,
+                                    string &out_api_key,
+                                    string &out_headers_tsv) {
+  out_headers_tsv = cfg.headers_tsv;
+  if (!cfg.replay_secret_name.empty()) {
+    auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+    auto secret_entry = SecretManager::Get(context).GetSecretByName(
+        transaction, cfg.replay_secret_name);
+    if (!secret_entry || !secret_entry->secret) {
+      throw IOException("Lance namespace replay secret is unavailable: " +
+                        cfg.replay_secret_name);
+    }
+    auto *secret =
+        dynamic_cast<const KeyValueSecret *>(secret_entry->secret.get());
+    if (!secret ||
+        !StringUtil::CIEquals(secret->GetType(), "lance_namespace_replay")) {
+      throw IOException("Lance namespace replay secret has an invalid type: " +
+                        cfg.replay_secret_name);
+    }
+    out_bearer_token = SecretValueToString(secret->TryGetValue("bearer_token"));
+    out_api_key = SecretValueToString(secret->TryGetValue("api_key"));
+    out_headers_tsv = SecretValueToString(secret->TryGetValue("headers_tsv"));
+    return;
+  }
+
+  unordered_map<string, Value> overrides;
+  if (!cfg.bearer_token_override.empty()) {
+    overrides["bearer_token"] = Value(cfg.bearer_token_override);
+  }
+  if (!cfg.api_key_override.empty()) {
+    overrides["api_key"] = Value(cfg.api_key_override);
+  }
+  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, out_bearer_token,
+                            out_api_key);
+}
+
+uint64_t
+ResolveLanceNamespaceTableVersion(ClientContext &context,
+                                  const LanceNamespaceTableConfig &cfg) {
+  if (!cfg.IsRest()) {
+    throw InternalException("Lance namespace table versions are resolved "
+                            "through the REST namespace");
+  }
+  string bearer_token;
+  string api_key;
+  string headers_tsv;
+  ResolveLanceNamespaceTableAuth(context, cfg, bearer_token, api_key,
+                                 headers_tsv);
+  auto version = lance_namespace_get_table_version(
+      cfg.endpoint.c_str(), cfg.table_id.c_str(),
+      bearer_token.empty() ? nullptr : bearer_token.c_str(),
+      api_key.empty() ? nullptr : api_key.c_str(),
+      cfg.delimiter.empty() ? nullptr : cfg.delimiter.c_str(),
+      headers_tsv.empty() ? nullptr : headers_tsv.c_str());
+  if (version == 0) {
+    throw IOException(
+        "Failed to resolve a fixed Lance namespace table version: " +
+        cfg.endpoint + "/" + cfg.table_id + LanceFormatErrorSuffix());
+  }
+  return version;
+}
+
 void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                 string &out_open_path, vector<string> &out_keys,
                                 vector<string> &out_values) {
@@ -270,7 +413,7 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
   out_keys.clear();
   out_values.clear();
 
-  out_open_path = LanceNormalizeS3Scheme(out_open_path);
+  out_open_path = LanceNormalizeDatasetPath(context, out_open_path);
   LanceFillStorageOptionsFromSecrets(context, out_open_path, out_keys,
                                      out_values);
 }
@@ -554,17 +697,30 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
 
 LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
                                            const string &input) {
+  auto candidate = input;
+  bool force_table = false;
+  if (candidate.rfind("path:", 0) == 0) {
+    return nullptr;
+  }
+  if (candidate.rfind("table:", 0) == 0) {
+    candidate = candidate.substr(6);
+    force_table = true;
+  }
   // Fast-path bail-out: obvious filesystem / URL literals can never match a
   // qualified catalog identifier.  Avoids parsing attempts and potential
   // secondary lookups that would just end up throwing ParserException.
-  if (input.empty() || input.find('/') != string::npos ||
-      input.find('\\') != string::npos || input.find("://") != string::npos) {
+  if (candidate.empty() || candidate.find('/') != string::npos ||
+      candidate.find('\\') != string::npos ||
+      candidate.find("://") != string::npos ||
+      (!force_table && candidate.size() >= 6 &&
+       StringUtil::CIEquals(candidate.substr(candidate.size() - 6),
+                            ".lance"))) {
     return nullptr;
   }
 
   QualifiedName qname;
   try {
-    qname = QualifiedName::Parse(input);
+    qname = QualifiedName::Parse(candidate);
   } catch (ParserException &) {
     return nullptr;
   }
@@ -580,6 +736,15 @@ LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
     return nullptr;
   }
   return dynamic_cast<LanceTableEntry *>(table_entry);
+}
+
+void RequireLanceTableWritable(const LanceTableEntry &table,
+                               const string &operation) {
+  if (table.ParentCatalog().GetAttached().IsReadOnly()) {
+    throw InvalidInputException(
+        operation +
+        " cannot modify a Lance table through an attachment in read-only mode");
+  }
 }
 
 void *LanceOpenDatasetForTable(ClientContext &context,
@@ -742,8 +907,8 @@ int64_t LanceTruncateDatasetWithStorageOptions(
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, LanceGetSessionHandle(context),
-      &schema_root.arrow_schema);
+      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, nullptr, 1,
+      LanceGetSessionHandle(context), &schema_root.arrow_schema);
   if (!writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());

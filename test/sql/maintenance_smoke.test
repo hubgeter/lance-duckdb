@@ -54,3 +54,23 @@ older_than_seconds must be >= 0
 
 statement ok
 DETACH maintenance_ns;
+
+statement ok
+ATTACH 'test/.tmp' AS "maintenance.ns-x" (TYPE LANCE);
+
+query TTT
+OPTIMIZE "maintenance.ns-x"."main"."maintenance_smoke";
+----
+compact	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+
+query TTT
+VACUUM LANCE "maintenance.ns-x"."main"."maintenance_smoke" WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true
+);
+----
+cleanup	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+
+statement ok
+DETACH "maintenance.ns-x";

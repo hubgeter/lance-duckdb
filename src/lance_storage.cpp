@@ -19,6 +19,7 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -36,11 +37,11 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
@@ -57,6 +58,7 @@ struct LanceDirectoryNamespaceConfig {
   string root;
   vector<string> option_keys;
   vector<string> option_values;
+  string replay_secret_name;
 };
 
 struct LanceRestNamespaceConfig {
@@ -66,6 +68,7 @@ struct LanceRestNamespaceConfig {
   string bearer_token_override;
   string api_key_override;
   string headers_tsv; // Tab-separated key\tvalue pairs for custom headers
+  string replay_secret_name;
 };
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -399,14 +402,15 @@ public:
       Catalog &catalog, SchemaCatalogEntry &schema, string endpoint,
       string namespace_id, string bearer_token, string api_key,
       string delimiter, string bearer_token_override, string api_key_override,
-      string headers_tsv)
+      string headers_tsv, string replay_secret_name)
       : DefaultGenerator(catalog), schema(schema),
         endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
         bearer_token(std::move(bearer_token)), api_key(std::move(api_key)),
         delimiter(std::move(delimiter)),
         bearer_token_override(std::move(bearer_token_override)),
         api_key_override(std::move(api_key_override)),
-        headers_tsv(std::move(headers_tsv)) {}
+        headers_tsv(std::move(headers_tsv)),
+        replay_secret_name(std::move(replay_secret_name)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
@@ -551,6 +555,7 @@ private:
     cfg.bearer_token_override = bearer_token_override;
     cfg.api_key_override = api_key_override;
     cfg.headers_tsv = headers_tsv;
+    cfg.replay_secret_name = replay_secret_name;
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
@@ -590,6 +595,7 @@ private:
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+  string replay_secret_name;
 };
 
 static string GetDatasetDirName(const string &table_name) {
@@ -791,7 +797,10 @@ public:
           break;
         }
         if (StringUtil::CIEquals(t, leaf_id)) {
-          table_id_for_ops = leaf_id;
+          // list_tables(namespace_id) may return names relative to that
+          // namespace. Mutating REST operations still require the qualified
+          // object id sent by create_table.
+          table_id_for_ops = prefixed_id.empty() ? leaf_id : prefixed_id;
           break;
         }
       }
@@ -929,7 +938,9 @@ public:
         }
         if (StringUtil::CIEquals(t, leaf_id)) {
           exists = true;
-          existing_id = leaf_id;
+          // A relative list result does not change the qualified id expected
+          // by declare/drop operations.
+          existing_id = prefixed_id.empty() ? leaf_id : prefixed_id;
           break;
         }
       }
@@ -1045,7 +1056,7 @@ public:
         key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr, nullptr, 1,
         LanceGetSessionHandle(context), &schema_root.arrow_schema);
     if (!writer) {
       throw IOException("Failed to open Lance writer: " + dataset_path +
@@ -1089,7 +1100,7 @@ public:
     return nullptr;
   }
 
-private:
+public:
   void InvalidateTableDefaults() {
     if (!table_default_generator) {
       return;
@@ -1097,6 +1108,7 @@ private:
     table_default_generator->created_all_entries = false;
   }
 
+private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   DefaultGenerator *table_default_generator = nullptr;
@@ -1112,6 +1124,29 @@ public:
                    shared_ptr<LanceRestNamespaceConfig> rest_ns)
       : DuckCatalog(db), directory_ns(std::move(directory_ns)),
         rest_ns(std::move(rest_ns)) {}
+
+  ~LanceDuckCatalog() override {
+    vector<string> replay_secret_names;
+    if (directory_ns && !directory_ns->replay_secret_name.empty()) {
+      replay_secret_names.push_back(directory_ns->replay_secret_name);
+    }
+    if (rest_ns && !rest_ns->replay_secret_name.empty()) {
+      replay_secret_names.push_back(rest_ns->replay_secret_name);
+    }
+    for (auto &secret_name : replay_secret_names) {
+      try {
+        auto transaction =
+            CatalogTransaction::GetSystemTransaction(GetDatabase());
+        SecretManager::Get(GetDatabase())
+            .DropSecretByName(transaction, secret_name,
+                              OnEntryNotFound::RETURN_NULL,
+                              SecretPersistType::TEMPORARY);
+      } catch (...) {
+        // Catalog teardown must remain noexcept. Temporary secrets are scoped
+        // to the database and are reclaimed when the database closes.
+      }
+    }
+  }
 
   using DuckCatalog::PlanUpdate;
 
@@ -1185,6 +1220,11 @@ public:
       throw NotImplementedException(
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
     }
+    // CTAS bypasses LanceSchemaEntry::CreateTable, so explicitly refresh the
+    // lazy namespace catalog after the statement. Invalidating at planning
+    // time is safe: a failed write simply causes the next lookup to re-list an
+    // unchanged namespace.
+    op.schema.Cast<LanceSchemaEntry>().InvalidateTableDefaults();
     if (rest_ns) {
       class PhysicalLanceCreateTableAs final : public PhysicalOperator {
       public:
@@ -1321,7 +1361,9 @@ public:
               break;
             }
             if (StringUtil::CIEquals(t, leaf_id)) {
-              state->table_id = leaf_id;
+              // REST list results are relative to namespace_id, while writer
+              // mutations use the fully qualified table id.
+              state->table_id = prefixed_id.empty() ? leaf_id : prefixed_id;
               break;
             }
           }
@@ -1388,7 +1430,8 @@ public:
               state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
               LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
               LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-              LanceGetSessionHandle(context), &state->schema_root.arrow_schema);
+              nullptr, 1, LanceGetSessionHandle(context),
+              &state->schema_root.arrow_schema);
           if (!state->writer) {
             throw IOException("Failed to open Lance writer: " +
                               state->open_path + LanceFormatErrorSuffix());
@@ -1721,6 +1764,14 @@ static unique_ptr<Catalog>
 LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                    AttachedDatabase &db, const string &name, AttachInfo &info,
                    AttachOptions &attach_options) {
+  // AttachedDatabase records the requested access mode before this callback.
+  // Its Lance catalog is backed by an in-memory DuckDB storage manager, which
+  // cannot itself start read-only. Keep the database entry read-only while
+  // allowing only that internal backing store to initialize read-write.
+  if (attach_options.access_mode == AccessMode::READ_ONLY) {
+    attach_options.access_mode = AccessMode::READ_WRITE;
+  }
+
   // Consume Lance-specific options from attach_options.options so that
   // DuckDB doesn't complain about unrecognized options when creating storage.
   attach_options.options.erase("endpoint");
@@ -1753,6 +1804,12 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     ResolveLanceStorageOptions(context, root, open_root, option_keys,
                                option_values);
 
+    // Distributed plans carry secret snapshots, not raw storage credentials.
+    // Mirror resolved inline/provider options into a temporary TYPE LANCE
+    // secret so workers reopen the exact same namespace path and snapshot.
+    auto replay_secret_name = RegisterLanceStorageOptionsReplaySecret(
+        context, open_root, option_keys, option_values);
+
     string list_error;
     vector<string> discovered_tables;
     // Validate the namespace during ATTACH.
@@ -1766,6 +1823,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     directory_ns->root = std::move(open_root);
     directory_ns->option_keys = std::move(option_keys);
     directory_ns->option_values = std::move(option_values);
+    directory_ns->replay_secret_name = std::move(replay_secret_name);
   } else {
     namespace_id = attach_path;
     if (namespace_id.empty()) {
@@ -1793,6 +1851,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     rest_ns->bearer_token_override = bearer_token_override;
     rest_ns->api_key_override = api_key_override;
     rest_ns->headers_tsv = headers_tsv;
+    rest_ns->replay_secret_name = RegisterLanceNamespaceReplaySecret(
+        context, endpoint, bearer_token, api_key, headers_tsv);
   }
 
   // Back the attached catalog by an in-memory DuckCatalog that lazily
@@ -1818,7 +1878,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
         *catalog, schema, endpoint, namespace_id, std::move(bearer_token),
         std::move(api_key), delimiter, bearer_token_override, api_key_override,
-        headers_tsv);
+        headers_tsv, rest_ns->replay_secret_name);
   }
   auto *generator_ptr = generator.get();
   catalog_set.SetDefaultGenerator(std::move(generator));
@@ -1845,7 +1905,21 @@ public:
                              LancePendingAppend pending) {
     auto &transaction = transaction_p.Cast<DuckTransaction>();
     lock_guard<mutex> guard(pending_lock);
-    pending_appends[transaction.transaction_id].push_back(std::move(pending));
+    auto &appends = pending_appends[transaction.transaction_id];
+    if (!appends.empty()) {
+      lance_free_transaction(pending.transaction);
+      throw TransactionException(
+          "A DuckDB transaction may contain at most one Lance mutation; "
+          "commit or roll back the current mutation before starting another");
+    }
+    appends.push_back(std::move(pending));
+  }
+
+  bool HasPendingAppend(Transaction &transaction_p) {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    lock_guard<mutex> guard(pending_lock);
+    auto it = pending_appends.find(transaction.transaction_id);
+    return it != pending_appends.end() && !it->second.empty();
   }
 
   ErrorData CommitTransaction(ClientContext &context,
@@ -1874,17 +1948,26 @@ public:
           pending.option_keys.size(), LanceGetSessionHandle(context),
           pending.transaction);
       if (rc != 0) {
-        // Best-effort cleanup of any remaining pending transactions.
-        // Note: the transaction pointer is consumed by the commit call, even on
-        // error.
+        // The attempted transaction pointer is consumed by the commit call,
+        // even on error. Abort every transaction that was not attempted yet so
+        // its unreferenced data and deletion files do not accumulate forever.
+        vector<string> abort_errors;
         for (idx_t cleanup_idx = append_idx + 1; cleanup_idx < appends.size();
              cleanup_idx++) {
-          lance_free_transaction(appends[cleanup_idx].transaction);
+          auto cleanup_error =
+              AbortPendingAppend(&context, appends[cleanup_idx]);
+          if (!cleanup_error.empty()) {
+            abort_errors.push_back(std::move(cleanup_error));
+          }
         }
         DuckTransactionManager::RollbackTransaction(transaction_p);
-        return ErrorData(ExceptionType::TRANSACTION,
-                         "Failed to commit Lance append transaction for '" +
-                             pending.path + "'" + LanceFormatErrorSuffix());
+        auto message = "Failed to commit Lance append transaction for '" +
+                       pending.path + "'" + LanceFormatErrorSuffix();
+        if (!abort_errors.empty()) {
+          message +=
+              "; abort cleanup failed: " + StringUtil::Join(abort_errors, "; ");
+        }
+        return ErrorData(ExceptionType::TRANSACTION, message);
       }
     }
 
@@ -1909,13 +1992,41 @@ public:
         pending_appends.erase(it);
       }
     }
+    vector<string> abort_errors;
     for (auto &pending : appends) {
-      lance_free_transaction(pending.transaction);
+      auto cleanup_error = AbortPendingAppend(nullptr, pending);
+      if (!cleanup_error.empty()) {
+        abort_errors.push_back(std::move(cleanup_error));
+      }
     }
     DuckTransactionManager::RollbackTransaction(transaction_p);
+    if (!abort_errors.empty()) {
+      throw IOException(
+          "Failed to clean up rolled-back Lance transaction(s): " +
+          StringUtil::Join(abort_errors, "; "));
+    }
   }
 
 private:
+  static string AbortPendingAppend(ClientContext *context,
+                                   LancePendingAppend &pending) {
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(pending.option_keys, pending.option_values,
+                                    key_ptrs, value_ptrs);
+    auto rc = lance_abort_transaction_with_storage_options(
+        pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(),
+        pending.option_keys.size(),
+        context ? LanceGetSessionHandle(*context) : nullptr,
+        pending.transaction);
+    pending.transaction = nullptr;
+    if (rc == 0) {
+      return "";
+    }
+    return "'" + pending.path + "'" + LanceFormatErrorSuffix();
+  }
+
   mutex pending_lock;
   unordered_map<transaction_t, vector<LancePendingAppend>> pending_appends;
 };
@@ -1951,6 +2062,23 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
   tm->RegisterPendingAppend(txn, std::move(pending));
+}
+
+void RequireLanceMutationSlot(ClientContext &context, Catalog &catalog) {
+  if (context.transaction.IsAutoCommit()) {
+    return;
+  }
+  auto &txn = Transaction::Get(context, catalog);
+  auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
+  if (!tm) {
+    throw InternalException(
+        "RequireLanceMutationSlot requires LanceTransactionManager");
+  }
+  if (tm->HasPendingAppend(txn)) {
+    throw TransactionException(
+        "A DuckDB transaction may contain at most one Lance mutation; commit "
+        "or roll back the current mutation before starting another");
+  }
 }
 
 } // namespace duckdb

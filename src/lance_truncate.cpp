@@ -10,6 +10,9 @@
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
+#include "lance_ffi.hpp"
+#include "lance_insert.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
 #include <cctype>
@@ -165,6 +168,8 @@ static void LanceTruncateFunc(ClientContext &context, TableFunctionInput &data,
     throw NotImplementedException(
         "TRUNCATE TABLE is only supported for tables backed by Lance");
   }
+  RequireLanceTableWritable(*lance_entry, "TRUNCATE TABLE");
+  RequireLanceMutationSlot(context, lance_entry->catalog);
 
   string open_path;
   vector<string> option_keys;
@@ -172,9 +177,42 @@ static void LanceTruncateFunc(ClientContext &context, TableFunctionInput &data,
   string display_uri;
   ResolveLanceStorageOptionsForTable(context, *lance_entry, open_path,
                                      option_keys, option_values, display_uri);
-  auto row_count = LanceTruncateDatasetWithStorageOptions(
-      context, open_path, option_keys, option_values, display_uri);
-  LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+
+  void *transaction = nullptr;
+  int64_t row_count = 0;
+  auto rc = lance_delete_transaction_with_storage_options(
+      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      nullptr, 0, LanceGetSessionHandle(context), &transaction, &row_count);
+  if (rc != 0) {
+    throw IOException("Failed to create Lance TRUNCATE transaction for '" +
+                      display_uri + "'" + LanceFormatErrorSuffix());
+  }
+
+  if (transaction) {
+    if (context.transaction.IsAutoCommit()) {
+      rc = lance_commit_transaction_with_storage_options(
+          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+          LanceGetSessionHandle(context), transaction);
+      if (rc != 0) {
+        throw IOException("Failed to commit Lance TRUNCATE transaction for '" +
+                          display_uri + "'" + LanceFormatErrorSuffix());
+      }
+      LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+    } else {
+      auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
+      RegisterLancePendingAppend(context, lance_entry->catalog,
+                                 std::move(open_path), std::move(option_keys),
+                                 std::move(option_values), std::move(cache_key),
+                                 transaction);
+    }
+  }
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(row_count));
@@ -206,6 +244,7 @@ LanceTruncatePlan(ParserExtensionInfo *, ClientContext &context,
     throw NotImplementedException(
         "TRUNCATE TABLE is only supported for tables backed by Lance");
   }
+  RequireLanceTableWritable(*lance_entry, "TRUNCATE TABLE");
 
   ParserExtensionPlanResult result;
   result.function = LanceTruncateTableFunction();

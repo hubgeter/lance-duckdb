@@ -167,6 +167,8 @@ public:
     }
     state.emitted = true;
 
+    RequireLanceMutationSlot(context.client, table.catalog);
+
     string open_path;
     vector<string> option_keys;
     vector<string> option_values;

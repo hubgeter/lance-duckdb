@@ -24,8 +24,8 @@ use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
 use super::util::{
-    cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
-    FfiResult,
+    cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, to_c_string,
+    FfiError, FfiResult,
 };
 
 #[repr(C)]
@@ -45,6 +45,7 @@ pub struct LanceFragmentStats {
     pub bytes_on_disk: u64,
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void {
     match open_dataset_inner(path, ptr::null_mut()) {
@@ -59,6 +60,7 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_with_session(
     path: *const c_char,
@@ -99,6 +101,7 @@ fn open_dataset_inner(path: *const c_char, session: *mut c_void) -> FfiResult<Da
     Ok(DatasetHandle::new(dataset))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
     path: *const c_char,
@@ -124,6 +127,7 @@ pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_with_storage_options_and_session(
     path: *const c_char,
@@ -216,6 +220,7 @@ fn open_dataset_with_storage_options_inner(
     Ok(DatasetHandle::new(dataset))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {
@@ -225,6 +230,95 @@ pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void) -> u64 {
+    match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => {
+            clear_last_error();
+            handle.dataset.version_id()
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            0
+        }
+    }
+}
+
+fn dataset_snapshot_identity(dataset: &lance::Dataset) -> String {
+    let manifest = dataset.manifest();
+    let location = dataset.manifest_location();
+    format!(
+        "snapshot|{}|{}|{}|{}|{}",
+        manifest.version,
+        manifest.timestamp_nanos,
+        manifest.transaction_file.as_deref().unwrap_or_default(),
+        location.size.unwrap_or_default(),
+        location.e_tag.as_deref().unwrap_or_default(),
+    )
+}
+
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_generation_id(dataset: *mut c_void) -> *const c_char {
+    let handle = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null();
+        }
+    };
+    // This identity is deliberately scoped to the opened snapshot.  A worker
+    // validates it after checking out the serialized version, so ordinary
+    // commits and vacuuming version 1 cannot make a retained snapshot appear to
+    // belong to another dataset generation.  Recreating a dataset at the same
+    // URI produces a different manifest identity even if version numbers reset.
+    let generation_id = dataset_snapshot_identity(&handle.dataset);
+    clear_last_error();
+    to_c_string(generation_id).into_raw()
+}
+
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_checkout_version(
+    dataset: *mut c_void,
+    version: u64,
+) -> *mut c_void {
+    let handle = match unsafe { super::util::dataset_handle(dataset) } {
+        Ok(handle) => handle,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return ptr::null_mut();
+        }
+    };
+    if version == 0 {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "dataset version must be greater than zero",
+        );
+        return ptr::null_mut();
+    }
+    match runtime::block_on(handle.dataset.checkout_version(version)) {
+        Ok(Ok(dataset)) => {
+            record_dataset_open();
+            clear_last_error();
+            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(dataset)))) as *mut c_void
+        }
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetOpen,
+                format!("dataset checkout version {version}: {err}"),
+            );
+            ptr::null_mut()
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_count_rows(dataset: *mut c_void) -> i64 {
     match dataset_count_rows_inner(dataset) {
@@ -257,6 +351,7 @@ fn dataset_count_rows_inner(dataset: *mut c_void) -> FfiResult<i64> {
         .map_err(|_| FfiError::new(ErrorCode::DatasetCountRows, "row count overflow"))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
     match get_schema_inner(dataset) {
@@ -276,6 +371,7 @@ fn get_schema_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandl
     Ok(handle.arrow_schema.clone())
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_schema_for_scan(dataset: *mut c_void) -> *mut c_void {
     match get_schema_for_scan_inner(dataset) {
@@ -304,6 +400,7 @@ fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::Sc
     Ok(Arc::new(schema))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_fragments(
     dataset: *mut c_void,
@@ -340,6 +437,7 @@ fn dataset_list_fragments_inner(dataset: *mut c_void, out_len: *mut usize) -> Ff
     Ok(data)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_fragment_stats(
     dataset: *mut c_void,
@@ -396,6 +494,7 @@ fn dataset_list_fragment_stats_inner(
     Ok(data)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
     if ptr.is_null() {
@@ -407,6 +506,7 @@ pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_fragment_stats_list(ptr: *mut LanceFragmentStats, len: usize) {
     if ptr.is_null() {
@@ -418,6 +518,7 @@ pub unsafe extern "C" fn lance_free_fragment_stats_list(ptr: *mut LanceFragmentS
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_field_stats(
     dataset: *mut c_void,
@@ -483,6 +584,7 @@ fn dataset_list_field_stats_inner(
     Ok(unsafe { boxed_slice_to_c(out, out_len) })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_field_stats_list(ptr: *mut LanceFieldStats, len: usize) {
     if ptr.is_null() {
@@ -500,6 +602,7 @@ pub struct LanceNamedFieldStats {
     pub bytes_on_disk: u64,
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_named_field_stats(
     dataset: *mut c_void,
@@ -557,6 +660,7 @@ fn dataset_list_named_field_stats_inner(
     Ok(unsafe { boxed_slice_to_c(out, out_len) })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_named_field_stats_list(
     ptr: *mut LanceNamedFieldStats,
@@ -577,6 +681,7 @@ pub unsafe extern "C" fn lance_free_named_field_stats_list(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_delete(
     dataset: *mut c_void,
@@ -596,6 +701,7 @@ pub unsafe extern "C" fn lance_dataset_delete(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
     path: *const c_char,
@@ -882,4 +988,71 @@ fn dataset_delete_inner(
         std::ptr::write_unaligned(out_deleted_rows, deleted_rows_i64);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+
+    fn batch(value: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![value]));
+        RecordBatch::try_new(schema, vec![column]).unwrap()
+    }
+
+    #[test]
+    fn snapshot_identity_is_stable_after_new_commit_and_root_vacuum() {
+        let root = std::env::temp_dir().join(format!(
+            "lance-duckdb-snapshot-identity-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = root.join("dataset.lance").to_string_lossy().into_owned();
+
+        let (coordinator_identity, latest_identity, checked_out_identity) =
+            runtime::block_on(async {
+                let overwrite = WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                };
+                InsertBuilder::new(path.as_str())
+                    .with_params(&overwrite)
+                    .execute(vec![batch(1)])
+                    .await?;
+
+                let append = WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                };
+                let version_two = InsertBuilder::new(path.as_str())
+                    .with_params(&append)
+                    .execute(vec![batch(2)])
+                    .await?;
+                assert_eq!(version_two.version_id(), 2);
+                version_two
+                    .cleanup_old_versions(chrono::Duration::zero(), Some(true), Some(false))
+                    .await?;
+                assert!(version_two.checkout_version(1).await.is_err());
+                let coordinator_identity = dataset_snapshot_identity(&version_two);
+
+                let latest = InsertBuilder::new(path.as_str())
+                    .with_params(&append)
+                    .execute(vec![batch(3)])
+                    .await?;
+                assert_eq!(latest.version_id(), 3);
+                let latest_identity = dataset_snapshot_identity(&latest);
+                let checked_out = latest.checkout_version(2).await?;
+                let checked_out_identity = dataset_snapshot_identity(&checked_out);
+                Ok::<_, lance::Error>((coordinator_identity, latest_identity, checked_out_identity))
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(coordinator_identity, checked_out_identity);
+        assert_ne!(coordinator_identity, latest_identity);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

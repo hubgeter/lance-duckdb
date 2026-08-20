@@ -1100,6 +1100,7 @@ LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
     throw NotImplementedException(
         "__lance_create_index_table only supports tables backed by Lance");
   }
+  RequireLanceTableWritable(*lance_entry, "CREATE INDEX");
 
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
@@ -1173,6 +1174,7 @@ LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
     throw NotImplementedException(
         "__lance_drop_index_table only supports tables backed by Lance");
   }
+  RequireLanceTableWritable(*lance_entry, "DROP INDEX");
 
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
@@ -1439,6 +1441,7 @@ static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
     throw NotImplementedException(
         "BTREE index type is only supported for Lance tables");
   }
+  RequireLanceTableWritable(*lance_table, "CREATE INDEX");
 
   auto column = GetSingleColumnNameOrThrow(*op.info, *lance_table);
   auto index_type = NormalizeIndexType(op.info->index_type);
@@ -1523,6 +1526,58 @@ static bool TryParseIdentifier(const string &sql, string &out_ident,
   return true;
 }
 
+static bool TryParseQualifiedIdentifier(const string &sql, string &out_sql,
+                                        idx_t &out_consumed) {
+  out_sql.clear();
+  out_consumed = 0;
+  idx_t i = 0;
+  bool saw_part = false;
+  while (i < sql.size()) {
+    if (sql[i] == '"') {
+      i++;
+      bool closed = false;
+      while (i < sql.size()) {
+        if (sql[i] != '"') {
+          i++;
+          continue;
+        }
+        if (i + 1 < sql.size() && sql[i + 1] == '"') {
+          i += 2;
+          continue;
+        }
+        i++;
+        closed = true;
+        break;
+      }
+      if (!closed) {
+        return false;
+      }
+    } else {
+      auto start = i;
+      while (i < sql.size() && sql[i] != '.' && IsIdentChar(sql[i])) {
+        i++;
+      }
+      if (i == start) {
+        return false;
+      }
+    }
+    saw_part = true;
+    if (i >= sql.size() || sql[i] != '.') {
+      break;
+    }
+    i++;
+    if (i >= sql.size()) {
+      return false;
+    }
+  }
+  if (!saw_part) {
+    return false;
+  }
+  out_sql = sql.substr(0, i);
+  out_consumed = i;
+  return true;
+}
+
 static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
                                                   const string &query) {
   auto trimmed = TrimTrailingSemicolons(query);
@@ -1566,7 +1621,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       target_is_path = true;
     } else {
       string ident;
-      if (!TryParseIdentifier(rest, ident, consumed)) {
+      if (!TryParseQualifiedIdentifier(rest, ident, consumed)) {
         return ParserExtensionParseResult("CREATE INDEX requires ON <dataset>");
       }
       target_sql = ident;
@@ -1660,7 +1715,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       target_is_path = true;
     } else {
       string ident;
-      if (!TryParseIdentifier(rest, ident, consumed)) {
+      if (!TryParseQualifiedIdentifier(rest, ident, consumed)) {
         return ParserExtensionParseResult();
       }
       target_sql = ident;
@@ -1713,7 +1768,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       target_is_path = true;
     } else {
       string ident;
-      if (!TryParseIdentifier(rest, ident, consumed)) {
+      if (!TryParseQualifiedIdentifier(rest, ident, consumed)) {
         return ParserExtensionParseResult();
       }
       target_sql = ident;
@@ -1740,6 +1795,13 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
   auto *parse_data = dynamic_cast<LanceIndexParseData *>(parse_data_p.get());
   if (!parse_data) {
     throw InternalException("LanceIndexPlan received unexpected parse data");
+  }
+
+  if ((parse_data->kind == LanceIndexStmtKind::Create ||
+       parse_data->kind == LanceIndexStmtKind::Drop) &&
+      !context.transaction.IsAutoCommit()) {
+    throw NotImplementedException(
+        "Lance index DDL does not support explicit transactions yet");
   }
 
   ParserExtensionPlanResult result;
@@ -1837,6 +1899,18 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
   }
   default:
     throw InternalException("unknown Lance index statement kind");
+  }
+
+  if (qname && (parse_data->kind == LanceIndexStmtKind::Create ||
+                parse_data->kind == LanceIndexStmtKind::Drop)) {
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                                    qname->catalog, qname->schema, qname->name);
+    auto &catalog = entry.ParentCatalog();
+    result.modified_databases[catalog.GetName()] =
+        StatementProperties::ModificationInfo{
+            StatementProperties::CatalogIdentity{
+                catalog.GetOid(), catalog.GetCatalogVersion(context)},
+            DatabaseModificationType::CREATE_INDEX};
   }
 
   return result;

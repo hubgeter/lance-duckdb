@@ -12,6 +12,31 @@ query TTTIT
 SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance';
 ----
 
+# Index commits are external to DuckDB transactions, so reject them before
+# execution instead of reporting a rollback after the index was persisted.
+statement ok
+BEGIN;
+
+statement error
+CREATE INDEX transaction_idx ON 'test/.tmp/index_ddl_base.lance' (label) USING BTREE;
+----
+Not implemented Error: Lance index DDL does not support explicit transactions yet
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM (SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance') WHERE index_name = 'transaction_idx';
+----
+0
+
+# Misspelled vector parameters must not silently fall back to defaults.
+statement error
+CREATE INDEX misspelled_params_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
+USING IVF_FLAT WITH (num_partition=1);
+----
+IO Error: Failed to create Lance index (Lance error: unknown parameter for IVF_FLAT: num_partition
+
 statement ok
 CREATE INDEX vec_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
 USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
@@ -61,6 +86,27 @@ use memory;
 
 statement ok
 DETACH ns;
+
+# Quoted qualified targets preserve dots and punctuation inside catalog/table
+# names instead of splitting them into extra qualification levels.
+statement ok
+ATTACH 'test/.tmp' AS "index.ns-x" (TYPE LANCE);
+
+statement ok
+CREATE INDEX quoted_target_idx ON "index.ns-x"."main"."index_ddl_base" (label) USING BTREE;
+
+query I
+SELECT count(*)
+FROM (SHOW INDEXES ON "index.ns-x"."main"."index_ddl_base")
+WHERE index_name = 'quoted_target_idx';
+----
+1
+
+statement ok
+DROP INDEX quoted_target_idx ON "index.ns-x"."main"."index_ddl_base";
+
+statement ok
+DETACH "index.ns-x";
 
 query II
 EXPLAIN (FORMAT JSON)

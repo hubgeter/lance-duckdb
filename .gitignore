@@ -1,6 +1,5 @@
 # Rust
 /target
-Cargo.lock
 
 # DuckDB extension build
 build/

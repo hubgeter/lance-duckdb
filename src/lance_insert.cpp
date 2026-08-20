@@ -70,7 +70,8 @@ public:
   bool SinkOrderDependent() const override { return false; }
 
   unique_ptr<GlobalSinkState>
-  GetGlobalSinkState(ClientContext &) const override {
+  GetGlobalSinkState(ClientContext &context) const override {
+    RequireLanceMutationSlot(context, table.catalog);
     return make_uniq<LanceInsertGlobalState>(table, column_names, column_types);
   }
 
@@ -114,7 +115,7 @@ public:
           value_ptrs.empty() ? nullptr : value_ptrs.data(),
           gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
           LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
-          nullptr, LanceGetSessionHandle(context.client),
+          nullptr, nullptr, 1, LanceGetSessionHandle(context.client),
           &gstate.schema_root.arrow_schema);
       if (!gstate.writer) {
         throw IOException("Failed to open Lance writer: " + gstate.open_path +

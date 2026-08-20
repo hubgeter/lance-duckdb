@@ -14,35 +14,55 @@ class TableCatalogEntry;
 struct LanceNamespaceTableConfig;
 
 struct LanceScanBindData : public TableFunctionData {
-  string file_path;
-  bool explain_verbose = false;
-  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
-  void *dataset = nullptr;
-  bool dataset_cache_hit = false;
-  ArrowSchemaWrapper schema_root;
-  ArrowSchemaWrapper scan_schema_root;
-  ArrowTableSchema arrow_table;
-  ArrowTableSchema scan_arrow_table;
-  vector<string> names;
-  vector<LogicalType> types;
-  vector<string> lance_pushed_filter_ir_parts;
-  vector<string> duckdb_pushed_filter_sql_parts;
-  optional_ptr<TableCatalogEntry> table_entry = nullptr;
-  unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
+	string file_path;
+	bool explain_verbose = false;
+	shared_ptr<LanceDatasetCacheEntry> dataset_entry;
+	void *dataset = nullptr;
+	bool dataset_cache_hit = false;
+	ArrowSchemaWrapper schema_root;
+	ArrowSchemaWrapper scan_schema_root;
+	ArrowTableSchema arrow_table;
+	ArrowTableSchema scan_arrow_table;
+	vector<string> names;
+	vector<LogicalType> types;
+	uint64_t dataset_version = 0;
+	string dataset_generation_id;
 
-  bool sampling_pushed_down = false;
-  double sample_percentage = 0.0;
-  int64_t sample_seed = -1;
-  bool sample_repeatable = false;
-  vector<uint64_t> take_row_ids;
+	//! Process-independent distributed scan state. A split contains only a
+	//! fragment id; URI, version, projections and filters live in serialized
+	//! bind data. Search/query-table paths use one explicit global split.
+	bool scan_splits_applied = false;
+	bool force_global_scan = false;
+	vector<uint64_t> selected_fragment_ids;
 
-  bool limit_offset_pushed_down = false;
-  optional_idx pushed_limit = optional_idx::Invalid();
-  idx_t pushed_offset = 0;
+	//! Namespace identity is retained without resolved credentials. Workers
+	//! resolve their own temporary TYPE LANCE secret before reopening.
+	bool reopen_via_namespace = false;
+	string namespace_endpoint;
+	string namespace_table_id;
+	string namespace_delimiter;
+	vector<string> lance_pushed_filter_ir_parts;
+	vector<string> duckdb_pushed_filter_sql_parts;
+	optional_ptr<TableCatalogEntry> table_entry = nullptr;
+	unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
 
-  bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
+	bool sampling_pushed_down = false;
+	double sample_percentage = 0.0;
+	int64_t sample_seed = -1;
+	bool sample_repeatable = false;
+	vector<uint64_t> take_row_ids;
 
-  ~LanceScanBindData() override;
+	bool limit_offset_pushed_down = false;
+	optional_idx pushed_limit = optional_idx::Invalid();
+	idx_t pushed_offset = 0;
+
+	bool UsesNamespaceQuery() const {
+		return namespace_query_config != nullptr;
+	}
+
+	unique_ptr<FunctionData> Copy() const override;
+
+	~LanceScanBindData() override;
 };
 
 } // namespace duckdb

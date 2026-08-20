@@ -1,45 +1,35 @@
-# Lance DuckDB Extension
+# Lance for Vane
 
-[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
+[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This repository contains the Lance extension source maintained specifically for [Vane](https://github.com/hubgeter/vane).
 
-## Install
+> [!IMPORTANT]
+> This repository does not build or publish a standalone DuckDB extension. Vane consumes it at a pinned revision,
+> compiles it against Vane's DuckDB fork, and statically links it into `vane._native`. Do not run `INSTALL lance` or
+> `LOAD lance` in Vane.
 
-### Install from DuckDB (recommended)
+## Build and test through Vane
 
-If you just want to use the extension, install it directly from DuckDB's core extensions repository:
-
-```sql
-INSTALL lance;
-LOAD lance;
-
-SELECT *
-  FROM 'path/to/dataset.lance'
-  LIMIT 1;
-```
-
-See DuckDB's extension page for `lance` for the latest release details: https://duckdb.org/docs/stable/core_extensions/lance
-
-### Build from source (development)
-
-This repository focuses on source builds for development and CI.
-
-1. Initialize submodules:
+Keep a Vane checkout and this checkout side by side. Point Vane at the local Lance source so coordinated changes are
+built without publishing an intermediate Git revision:
 
 ```bash
-git submodule update --init --recursive
+cd /path/to/vane
+export DUCKDB_LANCE_DIRECTORY=/path/to/lance-duckdb
+export SKBUILD_BUILD_DIR="$PWD/build/python-release"
+export SKBUILD_CMAKE_BUILD_TYPE=Release
+uv pip install . --no-build-isolation
 ```
 
-2. Build:
+Run the Lance-focused installed-package tests from the Vane checkout:
 
 ```bash
-GEN=ninja make release
+scripts/run_installed_pytest.sh \
+  tests/fast/test_lance.py \
+  tests/fast/test_lance_coordinator.py
 ```
 
-3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
-
-```bash
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
-```
+Vane's complete executable guide and validation matrix are maintained in
+[`LANCE.md`](https://github.com/hubgeter/vane/blob/lance-impl/LANCE.md).
 
 ## Usage
 
@@ -97,7 +87,7 @@ COPY (
 COPY (
   SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
   LIMIT 0
-) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
+) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite');
 ```
 
 To write to `s3://...` paths, configure a `TYPE LANCE` secret for that scope (see [`docs/cloud.md`](./docs/cloud.md)).

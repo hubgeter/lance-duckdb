@@ -9,6 +9,7 @@ use arrow::compute;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use chrono::{Duration, Utc};
+use futures::TryStreamExt;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
@@ -57,6 +58,44 @@ struct CleanupOldVersionsOptionsInput {
 struct CleanupOldVersionsMetricsOutput {
     bytes_removed: u64,
     old_versions: u64,
+}
+
+async fn cleanup_vane_control_files(
+    dataset: &Dataset,
+    older_than_seconds: i64,
+    delete_unverified: bool,
+) -> Result<(), lance::Error> {
+    // Match Lance's safety window for unverified files so a cleanup running
+    // without the caller's coordination cannot erase an active write.  An
+    // explicitly unsafe cleanup may use the requested threshold directly.
+    const UNVERIFIED_GRACE_SECONDS: i64 = 7 * 24 * 60 * 60;
+    let retention_seconds = if delete_unverified {
+        older_than_seconds
+    } else {
+        older_than_seconds.max(UNVERIFIED_GRACE_SECONDS)
+    };
+    let cutoff = Utc::now() - Duration::seconds(retention_seconds);
+    let store = dataset.object_store(None).await?;
+    let base = dataset.branch_location().path;
+
+    for directory in ["_vane_operations", "_vane_staging"] {
+        let prefix = if base.as_ref().is_empty() {
+            object_store::path::Path::parse(directory)?
+        } else {
+            object_store::path::Path::parse(format!("{}/{directory}", base.as_ref()))?
+        };
+        let objects = match store.list(Some(prefix)).try_collect::<Vec<_>>().await {
+            Ok(objects) => objects,
+            Err(error) if error.is_not_found() => continue,
+            Err(error) => return Err(error),
+        };
+        for object in objects {
+            if object.last_modified < cutoff {
+                store.delete(&object.location).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for CleanupOldVersionsOptionsInput {
@@ -178,6 +217,7 @@ fn parse_arrow_schema(schema: *const c_void, what: &'static str) -> FfiResult<Ar
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_add_columns(
     dataset: *mut c_void,
@@ -351,6 +391,7 @@ fn dataset_add_columns_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_drop_columns(
     dataset: *mut c_void,
@@ -395,6 +436,7 @@ fn dataset_drop_columns_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_alter_columns_rename(
     dataset: *mut c_void,
@@ -434,6 +476,7 @@ fn dataset_alter_columns_rename_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_alter_columns_set_nullable(
     dataset: *mut c_void,
@@ -472,6 +515,7 @@ fn dataset_alter_columns_set_nullable_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_alter_columns_cast(
     dataset: *mut c_void,
@@ -519,6 +563,7 @@ fn dataset_alter_columns_cast_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_table_metadata(
     dataset: *mut c_void,
@@ -566,6 +611,7 @@ fn dataset_update_table_metadata_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_config(
     dataset: *mut c_void,
@@ -613,6 +659,7 @@ fn dataset_update_config_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_schema_metadata(
     dataset: *mut c_void,
@@ -660,6 +707,7 @@ fn dataset_update_schema_metadata_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_field_metadata(
     dataset: *mut c_void,
@@ -719,6 +767,7 @@ fn dataset_update_field_metadata_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_compact_files(dataset: *mut c_void) -> i32 {
     match dataset_compact_files_with_options_inner(dataset, ptr::null(), ptr::null_mut()) {
@@ -733,6 +782,7 @@ pub unsafe extern "C" fn lance_dataset_compact_files(dataset: *mut c_void) -> i3
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_compact_files_with_options(
     dataset: *mut c_void,
@@ -780,6 +830,7 @@ fn dataset_compact_files_with_options_inner(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     dataset: *mut c_void,
@@ -803,6 +854,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
     dataset: *mut c_void,
@@ -873,7 +925,12 @@ fn dataset_cleanup_old_versions_with_options_struct(
     }
 
     let policy = builder.build();
-    match runtime::block_on(ds.cleanup_with_policy(policy)) {
+    match runtime::block_on(async {
+        let stats = ds.cleanup_with_policy(policy).await?;
+        cleanup_vane_control_files(&ds, options.older_than_seconds, options.delete_unverified)
+            .await?;
+        Ok::<_, lance::Error>(stats)
+    }) {
         Ok(Ok(stats)) => {
             let metrics = CleanupOldVersionsMetricsOutput {
                 bytes_removed: stats.bytes_removed,
@@ -894,6 +951,7 @@ fn dataset_cleanup_old_versions_with_options_struct(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_config(dataset: *mut c_void) -> *const c_char {
     match dataset_list_kv_inner(dataset, "config") {
@@ -908,6 +966,7 @@ pub unsafe extern "C" fn lance_dataset_list_config(dataset: *mut c_void) -> *con
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_table_metadata(dataset: *mut c_void) -> *const c_char {
     match dataset_list_kv_inner(dataset, "metadata") {
@@ -922,6 +981,7 @@ pub unsafe extern "C" fn lance_dataset_list_table_metadata(dataset: *mut c_void)
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_schema_metadata(dataset: *mut c_void) -> *const c_char {
     match dataset_list_kv_inner(dataset, "schema_metadata") {
@@ -936,6 +996,7 @@ pub unsafe extern "C" fn lance_dataset_list_schema_metadata(dataset: *mut c_void
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_field_metadata(
     dataset: *mut c_void,
@@ -1013,6 +1074,7 @@ fn dataset_list_kv_inner(dataset: *mut c_void, which: &'static str) -> FfiResult
     Ok(out)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_indices(dataset: *mut c_void) -> *const c_char {
     match dataset_list_indices_inner(dataset) {
@@ -1059,6 +1121,7 @@ fn dataset_list_indices_inner(dataset: *mut c_void) -> FfiResult<String> {
     Ok(out)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_create_scalar_index(
     dataset: *mut c_void,

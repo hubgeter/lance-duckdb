@@ -97,6 +97,22 @@ SELECT count(*) FROM baseline WHERE name NOT IN ('Alice', 'Eve');
 ----
 3
 
+# Floating-point comparisons stay in DuckDB because Lance/DataFusion use IEEE
+# NaN comparison semantics while DuckDB orders NaN above finite values and
+# considers NaN equal to itself.
+statement ok
+COPY (
+  SELECT 1.0::FLOAT AS f, 1.0::DOUBLE AS d
+  UNION ALL
+  SELECT 'NaN'::FLOAT AS f, 'NaN'::DOUBLE AS d
+) TO 'test/.tmp/scan_nan_filter.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+SELECT count(*) FILTER (WHERE f > 5.0), count(*) FILTER (WHERE d = 'NaN'::DOUBLE)
+FROM 'test/.tmp/scan_nan_filter.lance';
+----
+1	1
+
 # Explain output includes Lance-specific diagnostics (bind-time and runtime)
 query II
 EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;

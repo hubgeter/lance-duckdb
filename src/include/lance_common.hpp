@@ -6,6 +6,14 @@ struct LanceNamespaceQueryConfig;
 
 namespace duckdb {
 
+struct LanceLastError {
+  int32_t code = 0;
+  string message;
+
+  string ToString() const;
+};
+
+LanceLastError LanceConsumeLastErrorDetail();
 string LanceConsumeLastError();
 string LanceFormatErrorSuffix();
 
@@ -17,6 +25,7 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
 void *LanceOpenDataset(ClientContext &context, const string &path);
 
 string LanceNormalizeS3Scheme(const string &path);
+string LanceNormalizeDatasetPath(ClientContext &context, const string &path);
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,
                                         const string &path,
                                         vector<string> &out_keys,
@@ -36,6 +45,9 @@ static constexpr uint64_t LANCE_DEFAULT_MAX_BYTES_PER_FILE =
     90ULL * 1024ULL * 1024ULL * 1024ULL;
 static constexpr const char *LANCE_DEFAULT_DATA_STORAGE_VERSION = "2.2";
 
+struct LanceNamespaceTableConfig;
+class LanceTableEntry;
+
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,
                                string &out_bearer_token, string &out_api_key);
@@ -45,6 +57,22 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
 void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,
     string &out_api_key);
+string RegisterLanceNamespaceReplaySecret(ClientContext &context,
+                                          const string &endpoint,
+                                          const string &bearer_token,
+                                          const string &api_key,
+                                          const string &headers_tsv);
+string RegisterLanceStorageOptionsReplaySecret(
+    ClientContext &context, const string &scope,
+    const vector<string> &option_keys, const vector<string> &option_values);
+void ResolveLanceNamespaceTableAuth(ClientContext &context,
+                                    const LanceNamespaceTableConfig &cfg,
+                                    string &out_bearer_token,
+                                    string &out_api_key,
+                                    string &out_headers_tsv);
+uint64_t
+ResolveLanceNamespaceTableVersion(ClientContext &context,
+                                  const LanceNamespaceTableConfig &cfg);
 
 bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,
@@ -83,15 +111,14 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
                                 const string &api_key, const string &delimiter,
                                 const string &headers_tsv, string &out_error);
 
-struct LanceNamespaceTableConfig;
-class LanceTableEntry;
-
 void FillLanceNamespaceQueryConfig(
-    ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
-    bool prefilter, const string &filter, const vector<string> &columns,
+    ClientContext &context, const LanceNamespaceTableConfig &cfg,
+    uint64_t dataset_version, uint64_t k, bool prefilter, const string &filter,
+    const vector<string> &columns, vector<string> &resolved_option_keys,
+    vector<string> &resolved_option_values,
     vector<const char *> &option_key_ptrs,
     vector<const char *> &option_value_ptrs, vector<const char *> &column_ptrs,
-    string &bearer_token, string &api_key,
+    string &bearer_token, string &api_key, string &headers_tsv,
     ::LanceNamespaceQueryConfig &out_config);
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
@@ -106,6 +133,9 @@ string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
 // namespace URI directly to lance-io.
 LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
                                            const string &input);
+
+void RequireLanceTableWritable(const LanceTableEntry &table,
+                               const string &operation);
 
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,

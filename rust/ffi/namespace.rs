@@ -142,6 +142,7 @@ fn list_tables_inner(
     Ok(tables)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_namespace_list_tables(
     endpoint: *const c_char,
@@ -229,6 +230,7 @@ fn describe_table_info_inner(
     Ok((location, storage_options_tsv))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_namespace_describe_table(
     endpoint: *const c_char,
@@ -338,6 +340,7 @@ fn create_empty_table_inner(
     Ok((location, storage_options_tsv))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_namespace_create_empty_table(
     endpoint: *const c_char,
@@ -439,6 +442,7 @@ fn drop_table_inner(
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_namespace_drop_table(
     endpoint: *const c_char,
@@ -463,6 +467,99 @@ pub unsafe extern "C" fn lance_namespace_drop_table(
         Err(err) => {
             set_last_error(err.code, err.message);
             -1
+        }
+    }
+}
+
+fn namespace_table_version_inner(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> FfiResult<u64> {
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
+    let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
+
+    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter.clone())
+    .build();
+
+    runtime::block_on(async move {
+        record_namespace_describe();
+        let mut req = DescribeTableRequest::new();
+        req.id = Some(
+            table_id
+                .split(delimiter.as_str())
+                .map(str::to_string)
+                .collect(),
+        );
+        req.load_detailed_metadata = Some(true);
+        let resp = namespace.describe_table(req).await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTable,
+                format!("namespace describe_table version: {err}"),
+            )
+        })?;
+        let version = resp.version.ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTable,
+                "namespace describe_table version: missing version",
+            )
+        })?;
+        u64::try_from(version).map_err(|_| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTable,
+                format!("namespace describe_table version: invalid version {version}"),
+            )
+        })
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+}
+
+#[ffi_guard_macro::ffi_guard]
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_get_table_version(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> u64 {
+    match namespace_table_version_inner(
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+    ) {
+        Ok(version) if version > 0 => {
+            clear_last_error();
+            version
+        }
+        Ok(_) => {
+            set_last_error(
+                ErrorCode::NamespaceDescribeTable,
+                "namespace describe_table version: version must be greater than zero",
+            );
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            0
         }
     }
 }
@@ -531,6 +628,7 @@ fn describe_table_with_schema_inner(
     Ok(schema_json)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
     endpoint: *const c_char,
@@ -634,6 +732,7 @@ fn open_dataset_in_namespace_inner(
     Ok((DatasetHandle::new(dataset), table_uri))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_in_namespace(
     endpoint: *const c_char,
@@ -676,6 +775,7 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
     endpoint: *const c_char,
@@ -720,6 +820,7 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
 }
 
 /// Convert a JSON Arrow schema string to Arrow C Data Interface ArrowSchema.
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
     json_schema: *const c_char,

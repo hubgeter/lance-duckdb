@@ -139,3 +139,66 @@ COPY (
 ) TO 'test/.tmp/lance_write_bad_version.lance' (FORMAT lance, mode 'overwrite', data_storage_version 'bad_version');
 ----
 IO Error: Failed to open Lance writer:
+
+# Vector inference is based on rows rather than execution batch boundaries.
+statement ok
+COPY (
+  SELECT i::BIGINT AS id,
+         CASE WHEN i < 20000 THEN NULL::FLOAT[] ELSE [1.0, 2.0, 3.0]::FLOAT[] END AS vec
+  FROM range(20001) AS rows(i)
+) TO 'test/.tmp/lance_write_late_vector.lance' (FORMAT lance, mode 'overwrite');
+
+query TI
+SELECT typeof(vec), count(*)
+FROM 'test/.tmp/lance_write_late_vector.lance'
+GROUP BY ALL;
+----
+FLOAT[3]	20001
+
+# Explicit dimensions avoid inference and are propagated through the write bind.
+statement ok
+COPY (
+  SELECT *
+  FROM (VALUES
+    (1::BIGINT, [1.0, 2.0, 3.0]::FLOAT[]),
+    (2::BIGINT, NULL::FLOAT[])
+  ) AS rows(id, vec)
+) TO 'test/.tmp/lance_write_explicit_vector.lance'
+  (FORMAT lance, mode 'overwrite', vector_dims '{"vec":3}');
+
+query TI
+SELECT typeof(vec), count(*)
+FROM 'test/.tmp/lance_write_explicit_vector.lance'
+GROUP BY ALL;
+----
+FLOAT[3]	2
+
+# Ragged LIST(FLOAT) columns can opt out of vector normalization.
+statement ok
+COPY (
+  SELECT *
+  FROM (VALUES
+    (1::BIGINT, [1.0]::FLOAT[]),
+    (2::BIGINT, [2.0, 3.0]::FLOAT[])
+  ) AS rows(id, values)
+) TO 'test/.tmp/lance_write_ragged_list.lance'
+  (FORMAT lance, mode 'overwrite', infer_vector_dims false);
+
+query TII rowsort
+SELECT typeof(values), id, len(values)
+FROM 'test/.tmp/lance_write_ragged_list.lance';
+----
+FLOAT[]	1	1
+FLOAT[]	2	2
+
+statement error
+COPY (
+  SELECT *
+  FROM (VALUES
+    (1::BIGINT, [1.0, 2.0]::FLOAT[]),
+    (2::BIGINT, [3.0]::FLOAT[])
+  ) AS rows(id, embedding)
+) TO 'test/.tmp/lance_write_bad_vector_dim.lance'
+  (FORMAT lance, mode 'overwrite', vector_dims '{"embedding":2}');
+----
+IO Error: Failed to write to Lance dataset (Lance error: vector column 'embedding': vector dim mismatch

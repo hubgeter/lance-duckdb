@@ -39,6 +39,7 @@ struct OptimizeIndexMetricsOutput {
     num_indices_to_merge: Option<usize>,
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_index_list_schema(dataset: *mut c_void) -> *mut c_void {
     match get_index_list_schema_inner(dataset) {
@@ -58,6 +59,7 @@ fn get_index_list_schema_inner(dataset: *mut c_void) -> FfiResult<SchemaHandle> 
     Ok(index_list_schema())
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_index_list_stream(dataset: *mut c_void) -> *mut c_void {
     match create_index_list_stream_inner(dataset) {
@@ -158,6 +160,7 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
 
 /// Returns an array of column names that have scalar indices.
 /// The caller must free the returned array with `lance_free_scalar_indexed_columns`.
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
     dataset: *mut c_void,
@@ -187,6 +190,7 @@ pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_scalar_indexed_columns(ptr: *mut *mut c_char, len: usize) {
     if ptr.is_null() {
@@ -280,6 +284,7 @@ fn estimate_rows_indexed(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_create_index(
     dataset: *mut c_void,
@@ -397,6 +402,7 @@ fn dataset_create_index_inner(
     })?
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_drop_index(
     dataset: *mut c_void,
@@ -435,6 +441,7 @@ fn dataset_drop_index_inner(dataset: *mut c_void, index_name: *const c_char) -> 
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_optimize_index(
     dataset: *mut c_void,
@@ -459,6 +466,7 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_optimize_index_with_options(
     dataset: *mut c_void,
@@ -708,6 +716,52 @@ fn build_vector_params(
         }
     }
 
+    let mut allowed_keys = vec!["metric_type", "version", "num_partitions"];
+    match index_type {
+        "IVF_FLAT" => {}
+        "IVF_PQ" => allowed_keys.extend(["num_bits", "num_sub_vectors", "max_iterations"]),
+        "IVF_RQ" => allowed_keys.push("num_bits"),
+        "IVF_SQ" => allowed_keys.extend(["num_bits", "sample_rate"]),
+        "IVF_HNSW_FLAT" => allowed_keys.extend([
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_max_level",
+            "hnsw_prefetch_distance",
+        ]),
+        "IVF_HNSW_PQ" => allowed_keys.extend([
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_max_level",
+            "hnsw_prefetch_distance",
+            "num_bits",
+            "num_sub_vectors",
+            "max_iterations",
+        ]),
+        "IVF_HNSW_SQ" => allowed_keys.extend([
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_max_level",
+            "hnsw_prefetch_distance",
+            "num_bits",
+            "sample_rate",
+        ]),
+        other => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                format!("unsupported vector index_type: {other}"),
+            ))
+        }
+    }
+    if let Some(unknown) = params
+        .keys()
+        .find(|key| !allowed_keys.contains(&key.as_str()))
+    {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("unknown parameter for {index_type}: {unknown}"),
+        ));
+    }
+
     let metric = params
         .get("metric_type")
         .and_then(|v| v.as_str())
@@ -849,12 +903,7 @@ fn build_vector_params(
             }
             VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf, hnsw, sq)
         }
-        other => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetCreateIndex,
-                format!("unsupported vector index_type: {other}"),
-            ))
-        }
+        _ => unreachable!("index type was validated above"),
     };
 
     let mut out = out;

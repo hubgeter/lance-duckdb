@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +30,7 @@ use crate::runtime;
 
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage_options(
     path: *const c_char,
@@ -560,12 +561,14 @@ pub(super) async fn apply_deletions(
 
     let mut updated_fragments = Vec::new();
     let mut removed_fragment_ids = Vec::new();
+    let mut matched_fragment_ids = BTreeSet::new();
 
     for fragment in dataset.get_fragments() {
         let fragment_id = fragment.id() as u32;
         let Some(bitmap) = bitmaps.get(&fragment_id) else {
             continue;
         };
+        matched_fragment_ids.insert(fragment_id);
 
         match fragment
             .extend_deletions(bitmap.iter())
@@ -575,6 +578,18 @@ pub(super) async fn apply_deletions(
             Some(new_fragment) => updated_fragments.push(new_fragment.metadata().clone()),
             None => removed_fragment_ids.push(fragment_id as u64),
         }
+    }
+
+    if matched_fragment_ids.len() != bitmaps.len() {
+        let missing = bitmaps
+            .keys()
+            .filter(|fragment_id| !matched_fragment_ids.contains(fragment_id))
+            .map(u32::to_string)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "row addresses reference fragment(s) missing from pinned dataset version: {}",
+            missing.join(", ")
+        ));
     }
 
     Ok((updated_fragments, removed_fragment_ids))

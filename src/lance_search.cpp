@@ -6,6 +6,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/function/distributed_table_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -24,11 +25,11 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
 
@@ -41,6 +42,71 @@
 #include <unordered_map>
 
 namespace duckdb {
+
+static constexpr const char *LANCE_SEARCH_GLOBAL_SPLIT =
+    "lance-search-global-v1";
+static constexpr const char *LANCE_SEARCH_TASK_CODEC = "lance.search-task";
+static constexpr idx_t LANCE_SEARCH_PROTOCOL_VERSION = 1;
+static constexpr idx_t LANCE_SEARCH_TASK_CODEC_VERSION = 1;
+
+static DistributedScanTask LanceGlobalSearchTask(uint64_t k) {
+  DistributedScanTask task;
+  task.task_id = "global-search";
+  task.payload = LANCE_SEARCH_GLOBAL_SPLIT;
+  task.estimated_cardinality = optional_idx(NumericCast<idx_t>(k));
+  return task;
+}
+
+struct LanceGlobalSearchTaskState {
+  virtual ~LanceGlobalSearchTaskState() = default;
+  bool assigned_empty_scan = false;
+};
+
+static bool
+ValidateLanceGlobalSearchTasks(const vector<DistributedScanTask> &tasks) {
+  if (tasks.empty()) {
+    return false;
+  }
+  for (auto &task : tasks) {
+    if (task.task_id != "global-search" ||
+        task.payload != LANCE_SEARCH_GLOBAL_SPLIT) {
+      throw SerializationException(
+          "Lance search received an invalid global search split");
+    }
+  }
+  // FTE queues may merge replayed copies of the same indivisible global
+  // split. They are one idempotent assignment, not independent searches.
+  return true;
+}
+
+static void
+LancePrepareGlobalSearchBind(const TableFunctionDistributedScanInput &,
+                             FunctionData &) {}
+
+static void
+LanceApplyGlobalSearchTask(FunctionData &bind_data,
+                           const vector<DistributedScanTask> &tasks) {
+  auto *task_state = dynamic_cast<LanceGlobalSearchTaskState *>(&bind_data);
+  if (!task_state) {
+    throw InternalException(
+        "Lance global search bind data is missing task state");
+  }
+  task_state->assigned_empty_scan = !ValidateLanceGlobalSearchTasks(tasks);
+}
+
+static void PopulateSearchSchemaFromTypes(ClientContext &context,
+                                          ArrowSchemaWrapper &schema_root,
+                                          ArrowTableSchema &arrow_table,
+                                          const vector<string> &names,
+                                          const vector<LogicalType> &types) {
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  auto properties = context.GetClientProperties();
+  ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, types, names,
+                                properties);
+  LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
+                                               schema_root.arrow_schema);
+}
 
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
                                const vector<float> &query, uint64_t k,
@@ -249,7 +315,8 @@ static void PopulateNamespaceSearchSchema(
   return_types = result_types;
 }
 
-struct LanceKnnBindData : public TableFunctionData {
+struct LanceKnnBindData : public TableFunctionData,
+                          public LanceGlobalSearchTaskState {
   string file_path;
   string vector_column;
   vector<float> query;
@@ -262,17 +329,68 @@ struct LanceKnnBindData : public TableFunctionData {
   bool namespace_backed = false;
   LanceNamespaceTableConfig namespace_config;
   string namespace_filter;
+  idx_t task_cpu_slots = 1;
 
   shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
   bool dataset_cache_hit = false;
+  uint64_t dataset_version = 0;
+  string dataset_generation_id;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
-
   vector<string> lance_pushed_filter_ir_parts;
+  bool complex_filter_pushdown_failed = false;
+
+  unique_ptr<FunctionData> Copy() const override {
+    auto result = make_uniq<LanceKnnBindData>();
+    result->column_ids = column_ids;
+    result->file_path = file_path;
+    result->vector_column = vector_column;
+    result->query = query;
+    result->k = k;
+    result->nprobes = nprobes;
+    result->refine_factor = refine_factor;
+    result->prefilter = prefilter;
+    result->use_index = use_index;
+    result->explain_verbose = explain_verbose;
+    result->namespace_backed = namespace_backed;
+    result->namespace_config = namespace_config;
+    result->namespace_filter = namespace_filter;
+    result->task_cpu_slots = task_cpu_slots;
+    result->dataset_entry = dataset_entry;
+    result->dataset = dataset;
+    result->dataset_cache_hit = dataset_cache_hit;
+    result->dataset_version = dataset_version;
+    result->dataset_generation_id = dataset_generation_id;
+    result->arrow_table = arrow_table;
+    result->names = names;
+    result->types = types;
+    result->lance_pushed_filter_ir_parts = lance_pushed_filter_ir_parts;
+    result->complex_filter_pushdown_failed = complex_filter_pushdown_failed;
+    result->assigned_empty_scan = assigned_empty_scan;
+    return std::move(result);
+  }
 };
+
+static vector<DistributedScanTask>
+LancePlanDistributedKnnSearch(const TableFunctionDistributedScanInput &input) {
+  auto &bind_data = input.bind_data.Cast<LanceKnnBindData>();
+  return {LanceGlobalSearchTask(bind_data.k)};
+}
+
+static TableFunctionDistributedScanCallbacks
+LanceKnnDistributedScanCallbacks() {
+  TableFunctionDistributedScanCallbacks callbacks;
+  callbacks.protocol_version = LANCE_SEARCH_PROTOCOL_VERSION;
+  callbacks.task_codec = {LANCE_SEARCH_TASK_CODEC,
+                          LANCE_SEARCH_TASK_CODEC_VERSION};
+  callbacks.plan = LancePlanDistributedKnnSearch;
+  callbacks.prepare_bind = LancePrepareGlobalSearchBind;
+  callbacks.apply_tasks = LanceApplyGlobalSearchTask;
+  return callbacks;
+}
 
 struct LanceKnnGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
@@ -327,6 +445,7 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
 
   for (auto &expr : filters) {
     if (!expr || expr->HasParameter() || expr->IsVolatile()) {
+      scan_bind.complex_filter_pushdown_failed = true;
       continue;
     }
     if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
@@ -366,6 +485,7 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
     string filter_ir;
     if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
                                    *expr, filter_ir)) {
+      scan_bind.complex_filter_pushdown_failed = true;
       continue;
     }
     scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
@@ -404,6 +524,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   auto result = make_uniq<LanceKnnBindData>();
+  result->task_cpu_slots = MaxValue<idx_t>(1, context.db->NumberOfThreads());
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2], "lance_vector_search");
   result->prefilter = false;
@@ -473,11 +594,15 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  if (auto *table =
-          TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
+  auto *namespace_table =
+      TryResolveNamespaceBackedSearchTable(context, input.inputs[0]);
+  if (namespace_table && namespace_table->NamespaceConfig().IsRest()) {
+    auto *table = namespace_table;
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
+    result->dataset_version =
+        ResolveLanceNamespaceTableVersion(context, result->namespace_config);
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
     if (result->prefilter && result->namespace_filter.empty()) {
@@ -491,7 +616,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     return std::move(result);
   }
 
-  if (!result->namespace_filter.empty()) {
+  if (!result->namespace_filter.empty() &&
+      (!namespace_table || !namespace_table->NamespaceConfig().IsDirectory())) {
     throw InvalidInputException(
         "lance_vector_search filter parameter is only supported for "
         "namespace-backed tables");
@@ -508,6 +634,12 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
   }
+  result->dataset_version = lance_dataset_version(result->dataset);
+  if (result->dataset_version == 0) {
+    throw IOException("Failed to capture Lance dataset version: " +
+                      result->file_path + LanceFormatErrorSuffix());
+  }
+  result->dataset_generation_id = result->dataset_entry->GenerationId();
 
   auto *schema_handle = lance_get_knn_schema(
       result->dataset, result->vector_column.c_str(), result->query.data(),
@@ -561,6 +693,11 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, input, true);
+  if (bind_data.prefilter && bind_data.complex_filter_pushdown_failed) {
+    throw InvalidInputException(
+        "lance_vector_search cannot apply every complex predicate before top-k "
+        "when prefilter=true");
+  }
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException("lance_vector_search requires filter pushdown "
                                 "for prefilterable columns when "
@@ -608,19 +745,33 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   if (global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
+  if (bind_data.assigned_empty_scan) {
+    return std::move(result);
+  }
 
   if (bind_data.namespace_backed) {
+    vector<string> resolved_option_keys;
+    vector<string> resolved_option_values;
     vector<const char *> option_key_ptrs;
     vector<const char *> option_value_ptrs;
     vector<const char *> column_ptrs;
     string bearer_token;
     string api_key;
+    string headers_tsv;
     LanceNamespaceQueryConfig config;
     FillLanceNamespaceQueryConfig(
-        context.client, bind_data.namespace_config, bind_data.k,
-        bind_data.prefilter, bind_data.namespace_filter,
-        global.namespace_columns, option_key_ptrs, option_value_ptrs,
-        column_ptrs, bearer_token, api_key, config);
+        context.client, bind_data.namespace_config, bind_data.dataset_version,
+        bind_data.k, bind_data.prefilter, bind_data.namespace_filter,
+        global.namespace_columns, resolved_option_keys, resolved_option_values,
+        option_key_ptrs, option_value_ptrs, column_ptrs, bearer_token, api_key,
+        headers_tsv, config);
+    vector<const char *> expected_column_ptrs;
+    expected_column_ptrs.reserve(bind_data.names.size());
+    for (auto &name : bind_data.names) {
+      expected_column_ptrs.push_back(name.c_str());
+    }
+    config.expected_columns = expected_column_ptrs.data();
+    config.expected_columns_len = expected_column_ptrs.size();
     LanceNamespaceVectorSearchOptions options;
     options.vector_column = bind_data.vector_column.c_str();
     options.query_values = bind_data.query.data();
@@ -643,11 +794,14 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
           ? nullptr
           : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
   auto filter_ir_len = global.lance_filter_ir.size();
+  const char *filter_sql = bind_data.namespace_filter.empty()
+                               ? nullptr
+                               : bind_data.namespace_filter.c_str();
   result->stream = lance_create_knn_stream_ir(
       bind_data.dataset, bind_data.vector_column.c_str(),
       bind_data.query.data(), bind_data.query.size(), bind_data.k,
       bind_data.nprobes, bind_data.refine_factor, filter_ir, filter_ir_len,
-      bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+      filter_sql, bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
   if (!result->stream && filter_ir && !bind_data.prefilter) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
@@ -657,7 +811,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->stream = lance_create_knn_stream_ir(
         bind_data.dataset, bind_data.vector_column.c_str(),
         bind_data.query.data(), bind_data.query.size(), bind_data.k,
-        bind_data.nprobes, bind_data.refine_factor, nullptr, 0,
+        bind_data.nprobes, bind_data.refine_factor, nullptr, 0, filter_sql,
         bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
   }
   if (!result->stream) {
@@ -724,6 +878,9 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
   }
 
   auto &bind_data = data.bind_data->Cast<LanceKnnBindData>();
+  if (bind_data.assigned_empty_scan) {
+    return;
+  }
   auto &global_state = data.global_state->Cast<LanceKnnGlobalState>();
   auto &local_state = data.local_state->Cast<LanceKnnLocalState>();
 
@@ -895,6 +1052,122 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   return result;
 }
 
+static void LanceKnnSerialize(Serializer &serializer,
+                              const optional_ptr<FunctionData> bind_data_p,
+                              const TableFunction &) {
+  auto &bind_data = bind_data_p->Cast<LanceKnnBindData>();
+  serializer.WriteProperty(100, "file_path", bind_data.file_path);
+  serializer.WriteProperty(101, "vector_column", bind_data.vector_column);
+  serializer.WriteProperty(102, "query", bind_data.query);
+  serializer.WriteProperty(103, "k", bind_data.k);
+  serializer.WriteProperty(104, "nprobes", bind_data.nprobes);
+  serializer.WriteProperty(105, "refine_factor", bind_data.refine_factor);
+  serializer.WriteProperty(106, "prefilter", bind_data.prefilter);
+  serializer.WriteProperty(107, "use_index", bind_data.use_index);
+  serializer.WriteProperty(108, "explain_verbose", bind_data.explain_verbose);
+  serializer.WriteProperty(109, "namespace_backed", bind_data.namespace_backed);
+  serializer.WriteProperty(110, "namespace_filter", bind_data.namespace_filter);
+  serializer.WriteProperty(111, "dataset_version", bind_data.dataset_version);
+  serializer.WriteProperty(112, "names", bind_data.names);
+  serializer.WriteProperty(113, "types", bind_data.types);
+  serializer.WriteProperty(114, "lance_filter_ir_parts",
+                           bind_data.lance_pushed_filter_ir_parts);
+  if (bind_data.namespace_backed) {
+    auto &cfg = bind_data.namespace_config;
+    serializer.WriteProperty(115, "namespace_kind",
+                             static_cast<uint8_t>(cfg.kind));
+    serializer.WriteProperty(116, "namespace_root", cfg.root);
+    serializer.WriteProperty(117, "namespace_endpoint", cfg.endpoint);
+    serializer.WriteProperty(118, "namespace_table_id", cfg.table_id);
+    serializer.WriteProperty(119, "namespace_delimiter", cfg.delimiter);
+    serializer.WriteProperty(120, "namespace_display_uri", cfg.display_uri);
+    serializer.WriteProperty(121, "namespace_replay_secret_name",
+                             cfg.replay_secret_name);
+  }
+  serializer.WriteProperty(122, "dataset_generation_id",
+                           bind_data.dataset_generation_id);
+  serializer.WriteProperty(123, "complex_filter_pushdown_failed",
+                           bind_data.complex_filter_pushdown_failed);
+}
+
+static unique_ptr<FunctionData> LanceKnnDeserialize(Deserializer &deserializer,
+                                                    TableFunction &) {
+  auto result = make_uniq<LanceKnnBindData>();
+  auto &context = deserializer.Get<ClientContext &>();
+  result->task_cpu_slots = MaxValue<idx_t>(1, context.db->NumberOfThreads());
+  result->file_path = deserializer.ReadProperty<string>(100, "file_path");
+  result->vector_column =
+      deserializer.ReadProperty<string>(101, "vector_column");
+  result->query = deserializer.ReadProperty<vector<float>>(102, "query");
+  result->k = deserializer.ReadProperty<uint64_t>(103, "k");
+  result->nprobes = deserializer.ReadProperty<uint64_t>(104, "nprobes");
+  result->refine_factor =
+      deserializer.ReadProperty<uint64_t>(105, "refine_factor");
+  result->prefilter = deserializer.ReadProperty<bool>(106, "prefilter");
+  result->use_index = deserializer.ReadProperty<bool>(107, "use_index");
+  result->explain_verbose =
+      deserializer.ReadProperty<bool>(108, "explain_verbose");
+  result->namespace_backed =
+      deserializer.ReadProperty<bool>(109, "namespace_backed");
+  result->namespace_filter =
+      deserializer.ReadProperty<string>(110, "namespace_filter");
+  result->dataset_version =
+      deserializer.ReadProperty<uint64_t>(111, "dataset_version");
+  result->names = deserializer.ReadProperty<vector<string>>(112, "names");
+  result->types = deserializer.ReadProperty<vector<LogicalType>>(113, "types");
+  result->lance_pushed_filter_ir_parts =
+      deserializer.ReadProperty<vector<string>>(114, "lance_filter_ir_parts");
+  if (result->namespace_backed) {
+    auto &cfg = result->namespace_config;
+    cfg.kind = static_cast<LanceNamespaceKind>(
+        deserializer.ReadProperty<uint8_t>(115, "namespace_kind"));
+    cfg.root = deserializer.ReadProperty<string>(116, "namespace_root");
+    cfg.endpoint = deserializer.ReadProperty<string>(117, "namespace_endpoint");
+    cfg.table_id = deserializer.ReadProperty<string>(118, "namespace_table_id");
+    cfg.delimiter =
+        deserializer.ReadProperty<string>(119, "namespace_delimiter");
+    cfg.display_uri =
+        deserializer.ReadProperty<string>(120, "namespace_display_uri");
+    cfg.replay_secret_name =
+        deserializer.ReadProperty<string>(121, "namespace_replay_secret_name");
+    // Storage options, auth values and headers remain outside the plan.
+  }
+  result->dataset_generation_id =
+      deserializer.ReadProperty<string>(122, "dataset_generation_id");
+  result->complex_filter_pushdown_failed =
+      deserializer.ReadProperty<bool>(123, "complex_filter_pushdown_failed");
+  if (result->namespace_backed) {
+    if (result->dataset_version == 0) {
+      throw SerializationException("Serialized Lance namespace vector search "
+                                   "is missing its fixed dataset version");
+    }
+  } else {
+    if (result->dataset_version == 0) {
+      throw SerializationException("Serialized Lance vector search is missing "
+                                   "its fixed dataset version");
+    }
+    if (result->dataset_generation_id.empty()) {
+      throw SerializationException("Serialized Lance vector search is missing "
+                                   "its fixed dataset generation");
+    }
+    result->dataset_entry = LanceGetOrOpenDatasetEntryAtVersion(
+        context, result->file_path, result->dataset_version,
+        result->dataset_generation_id, &result->dataset_cache_hit);
+    result->dataset =
+        result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
+    if (!result->dataset ||
+        lance_dataset_version(result->dataset) != result->dataset_version) {
+      throw IOException(
+          "Failed to reopen fixed Lance vector-search snapshot: " +
+          result->file_path + LanceFormatErrorSuffix());
+    }
+  }
+  PopulateSearchSchemaFromTypes(context, result->schema_root,
+                                result->arrow_table, result->names,
+                                result->types);
+  return std::move(result);
+}
+
 static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.named_parameters["k"] = LogicalType::BIGINT;
@@ -911,6 +1184,9 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
     fun.pushdown_complex_filter = LancePushdownComplexFilter;
     fun.to_string = LanceKnnToString;
     fun.dynamic_to_string = LanceKnnDynamicToString;
+    fun.serialize = LanceKnnSerialize;
+    fun.deserialize = LanceKnnDeserialize;
+    fun.SetDistributedScanCallbacks(LanceKnnDistributedScanCallbacks());
   };
 
   TableFunction search_f32("lance_vector_search",
@@ -934,7 +1210,8 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
 
 enum class LanceSearchMode : uint8_t { Fts = 0, Hybrid = 1 };
 
-struct LanceSearchBindData : public TableFunctionData {
+struct LanceSearchBindData : public TableFunctionData,
+                             public LanceGlobalSearchTaskState {
   LanceSearchMode mode = LanceSearchMode::Fts;
 
   string file_path;
@@ -942,6 +1219,7 @@ struct LanceSearchBindData : public TableFunctionData {
   bool namespace_backed = false;
   LanceNamespaceTableConfig namespace_config;
   string namespace_filter;
+  idx_t task_cpu_slots = 1;
 
   // FTS mode
   string text_column;
@@ -962,11 +1240,119 @@ struct LanceSearchBindData : public TableFunctionData {
   shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
   bool dataset_cache_hit = false;
+  uint64_t dataset_version = 0;
+  string dataset_generation_id;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  vector<string> lance_pushed_filter_ir_parts;
+  bool complex_filter_pushdown_failed = false;
+
+  unique_ptr<FunctionData> Copy() const override {
+    auto result = make_uniq<LanceSearchBindData>();
+    result->column_ids = column_ids;
+    result->mode = mode;
+    result->file_path = file_path;
+    result->prefilter = prefilter;
+    result->namespace_backed = namespace_backed;
+    result->namespace_config = namespace_config;
+    result->namespace_filter = namespace_filter;
+    result->task_cpu_slots = task_cpu_slots;
+    result->text_column = text_column;
+    result->query = query;
+    result->vector_column = vector_column;
+    result->vector_query = vector_query;
+    result->text_query = text_query;
+    result->nprobes = nprobes;
+    result->refine_factor = refine_factor;
+    result->use_index = use_index;
+    result->alpha = alpha;
+    result->oversample_factor = oversample_factor;
+    result->k = k;
+    result->dataset_entry = dataset_entry;
+    result->dataset = dataset;
+    result->dataset_cache_hit = dataset_cache_hit;
+    result->dataset_version = dataset_version;
+    result->dataset_generation_id = dataset_generation_id;
+    result->arrow_table = arrow_table;
+    result->names = names;
+    result->types = types;
+    result->lance_pushed_filter_ir_parts = lance_pushed_filter_ir_parts;
+    result->complex_filter_pushdown_failed = complex_filter_pushdown_failed;
+    result->assigned_empty_scan = assigned_empty_scan;
+    return std::move(result);
+  }
 };
+
+static void
+LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
+                                 FunctionData *bind_data,
+                                 vector<unique_ptr<Expression>> &filters) {
+  if (!bind_data || filters.empty()) {
+    return;
+  }
+  auto &scan_bind = bind_data->Cast<LanceSearchBindData>();
+  if (scan_bind.namespace_backed) {
+    return;
+  }
+
+  for (auto &expr : filters) {
+    if (!expr || expr->HasParameter() || expr->IsVolatile()) {
+      scan_bind.complex_filter_pushdown_failed = true;
+      continue;
+    }
+    if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
+      auto &cmp = expr->Cast<BoundComparisonExpression>();
+      if (cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
+          cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        auto is_constant = [](const unique_ptr<Expression> &node) {
+          return node &&
+                 (node->expression_class == ExpressionClass::BOUND_CONSTANT ||
+                  (node->expression_class == ExpressionClass::BOUND_CAST &&
+                   !node->Cast<BoundCastExpression>().try_cast &&
+                   node->Cast<BoundCastExpression>().child &&
+                   node->Cast<BoundCastExpression>().child->expression_class ==
+                       ExpressionClass::BOUND_CONSTANT));
+        };
+        auto is_column = [](const unique_ptr<Expression> &node) {
+          return node &&
+                 (node->expression_class == ExpressionClass::BOUND_COLUMN_REF ||
+                  node->expression_class == ExpressionClass::BOUND_REF);
+        };
+        if ((is_column(cmp.left) && is_constant(cmp.right)) ||
+            (is_column(cmp.right) && is_constant(cmp.left))) {
+          continue;
+        }
+      }
+    }
+    string filter_ir;
+    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
+                                   *expr, filter_ir)) {
+      scan_bind.complex_filter_pushdown_failed = true;
+      continue;
+    }
+    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
+  }
+}
+
+static vector<DistributedScanTask>
+LancePlanDistributedSearch(const TableFunctionDistributedScanInput &input) {
+  auto &bind_data = input.bind_data.Cast<LanceSearchBindData>();
+  return {LanceGlobalSearchTask(bind_data.k)};
+}
+
+static TableFunctionDistributedScanCallbacks
+LanceSearchDistributedScanCallbacks() {
+  TableFunctionDistributedScanCallbacks callbacks;
+  callbacks.protocol_version = LANCE_SEARCH_PROTOCOL_VERSION;
+  callbacks.task_codec = {LANCE_SEARCH_TASK_CODEC,
+                          LANCE_SEARCH_TASK_CODEC_VERSION};
+  callbacks.plan = LancePlanDistributedSearch;
+  callbacks.prepare_bind = LancePrepareGlobalSearchBind;
+  callbacks.apply_tasks = LanceApplyGlobalSearchTask;
+  return callbacks;
+}
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
@@ -1008,16 +1394,28 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                                      LanceSearchGlobalState &global) {
   if (!local_state.stream) {
     if (bind_data.namespace_backed) {
+      vector<string> resolved_option_keys;
+      vector<string> resolved_option_values;
       vector<const char *> option_key_ptrs;
       vector<const char *> option_value_ptrs;
       vector<const char *> column_ptrs;
       string bearer_token;
       string api_key;
+      string headers_tsv;
       LanceNamespaceQueryConfig config;
       FillLanceNamespaceQueryConfig(
-          context, bind_data.namespace_config, bind_data.k, bind_data.prefilter,
-          bind_data.namespace_filter, global.namespace_columns, option_key_ptrs,
-          option_value_ptrs, column_ptrs, bearer_token, api_key, config);
+          context, bind_data.namespace_config, bind_data.dataset_version,
+          bind_data.k, bind_data.prefilter, bind_data.namespace_filter,
+          global.namespace_columns, resolved_option_keys,
+          resolved_option_values, option_key_ptrs, option_value_ptrs,
+          column_ptrs, bearer_token, api_key, headers_tsv, config);
+      vector<const char *> expected_column_ptrs;
+      expected_column_ptrs.reserve(bind_data.names.size());
+      for (auto &name : bind_data.names) {
+        expected_column_ptrs.push_back(name.c_str());
+      }
+      config.expected_columns = expected_column_ptrs.data();
+      config.expected_columns_len = expected_column_ptrs.size();
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();
       options.query = bind_data.query.c_str();
@@ -1036,10 +1434,14 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
 
       auto create_stream = [&](const uint8_t *ir, idx_t ir_len) -> void * {
         if (bind_data.mode == LanceSearchMode::Fts) {
+          const char *filter_sql = bind_data.namespace_filter.empty()
+                                       ? nullptr
+                                       : bind_data.namespace_filter.c_str();
           return lance_create_fts_stream_ir(
               bind_data.dataset, bind_data.text_column.c_str(),
               bind_data.query.c_str(), bind_data.k, ir,
-              NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0);
+              NumericCast<size_t>(ir_len), filter_sql,
+              bind_data.prefilter ? 1 : 0);
         }
         return lance_create_hybrid_stream_ir(
             bind_data.dataset, bind_data.vector_column.c_str(),
@@ -1127,6 +1529,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   }
 
   auto result = make_uniq<LanceSearchBindData>();
+  result->task_cpu_slots = MaxValue<idx_t>(1, context.db->NumberOfThreads());
   result->mode = LanceSearchMode::Fts;
   result->text_column = input.inputs[1].GetValue<string>();
   result->query = input.inputs[2].GetValue<string>();
@@ -1151,11 +1554,15 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
             .GetValue<bool>();
   }
 
-  if (auto *table =
-          TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
+  auto *namespace_table =
+      TryResolveNamespaceBackedSearchTable(context, input.inputs[0]);
+  if (namespace_table && namespace_table->NamespaceConfig().IsRest()) {
+    auto *table = namespace_table;
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
+    result->dataset_version =
+        ResolveLanceNamespaceTableVersion(context, result->namespace_config);
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
     if (result->prefilter && result->namespace_filter.empty()) {
@@ -1169,7 +1576,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     return std::move(result);
   }
 
-  if (!result->namespace_filter.empty()) {
+  if (!result->namespace_filter.empty() &&
+      (!namespace_table || !namespace_table->NamespaceConfig().IsDirectory())) {
     throw InvalidInputException(
         "lance_fts filter parameter is only supported for namespace-backed "
         "tables");
@@ -1186,6 +1594,12 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
   }
+  result->dataset_version = lance_dataset_version(result->dataset);
+  if (result->dataset_version == 0) {
+    throw IOException("Failed to capture Lance dataset version: " +
+                      result->file_path + LanceFormatErrorSuffix());
+  }
+  result->dataset_generation_id = result->dataset_entry->GenerationId();
 
   auto *schema_handle = lance_get_fts_schema(
       result->dataset, result->text_column.c_str(), result->query.c_str(),
@@ -1242,8 +1656,17 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
     throw InvalidInputException(
         "lance_hybrid_search requires a non-null query");
   }
+  if (auto *table =
+          TryResolveNamespaceBackedSearchTable(context, input.inputs[0]);
+      table && table->NamespaceConfig().IsRest()) {
+    throw NotImplementedException(
+        "Lance hybrid search is not supported for REST namespace-backed "
+        "tables; use vector or FTS search until "
+        "namespace hybrid-query support is available");
+  }
 
   auto result = make_uniq<LanceSearchBindData>();
+  result->task_cpu_slots = MaxValue<idx_t>(1, context.db->NumberOfThreads());
   result->mode = LanceSearchMode::Hybrid;
   result->file_path.clear();
   result->dataset_entry =
@@ -1325,15 +1748,23 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
       !oversample_named->second.IsNull()) {
     auto v = oversample_named->second.DefaultCastAs(LogicalType::INTEGER)
                  .GetValue<int32_t>();
-    if (v > 0) {
-      result->oversample_factor = NumericCast<uint32_t>(v);
+    if (v <= 0) {
+      throw InvalidInputException(
+          "lance_hybrid_search requires oversample_factor > 0");
     }
+    result->oversample_factor = NumericCast<uint32_t>(v);
   }
 
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
   }
+  result->dataset_version = lance_dataset_version(result->dataset);
+  if (result->dataset_version == 0) {
+    throw IOException("Failed to capture Lance dataset version: " +
+                      result->file_path + LanceFormatErrorSuffix());
+  }
+  result->dataset_generation_id = result->dataset_entry->GenerationId();
 
   auto *schema_handle = lance_get_hybrid_schema(result->dataset);
   if (!schema_handle) {
@@ -1385,6 +1816,14 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
 
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, input, true);
+  if (bind_data.prefilter && bind_data.complex_filter_pushdown_failed) {
+    auto function_name = bind_data.mode == LanceSearchMode::Fts
+                             ? "lance_fts"
+                             : "lance_hybrid_search";
+    throw InvalidInputException(string(function_name) +
+                                " cannot apply every complex predicate before "
+                                "top-k when prefilter=true");
+  }
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     auto function_name = bind_data.mode == LanceSearchMode::Fts
                              ? "lance_fts"
@@ -1395,9 +1834,17 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   }
 
   bool has_table_filter_parts = !table_filters.parts.empty();
+  auto filter_parts = std::move(table_filters.parts);
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    filter_parts.reserve(filter_parts.size() +
+                         bind_data.lance_pushed_filter_ir_parts.size());
+    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+      filter_parts.push_back(part);
+    }
+  }
   string filter_ir_msg;
-  if (!table_filters.parts.empty()) {
-    if (!TryEncodeLanceFilterIRMessage(table_filters.parts, filter_ir_msg)) {
+  if (!filter_parts.empty()) {
+    if (!TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
       filter_ir_msg.clear();
     }
     global.lance_filter_ir = std::move(filter_ir_msg);
@@ -1436,6 +1883,9 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
   }
 
   auto &bind_data = data.bind_data->Cast<LanceSearchBindData>();
+  if (bind_data.assigned_empty_scan) {
+    return;
+  }
   auto &global_state = data.global_state->Cast<LanceSearchGlobalState>();
   auto &local_state = data.local_state->Cast<LanceSearchLocalState>();
 
@@ -1547,6 +1997,134 @@ LanceSearchDynamicToString(TableFunctionDynamicToStringInput &input) {
   return result;
 }
 
+static void LanceSearchSerialize(Serializer &serializer,
+                                 const optional_ptr<FunctionData> bind_data_p,
+                                 const TableFunction &) {
+  auto &bind_data = bind_data_p->Cast<LanceSearchBindData>();
+  serializer.WriteProperty(100, "mode", static_cast<uint8_t>(bind_data.mode));
+  serializer.WriteProperty(101, "file_path", bind_data.file_path);
+  serializer.WriteProperty(102, "prefilter", bind_data.prefilter);
+  serializer.WriteProperty(103, "namespace_backed", bind_data.namespace_backed);
+  serializer.WriteProperty(104, "namespace_filter", bind_data.namespace_filter);
+  serializer.WriteProperty(105, "text_column", bind_data.text_column);
+  serializer.WriteProperty(106, "query", bind_data.query);
+  serializer.WriteProperty(107, "vector_column", bind_data.vector_column);
+  serializer.WriteProperty(108, "vector_query", bind_data.vector_query);
+  serializer.WriteProperty(109, "text_query", bind_data.text_query);
+  serializer.WriteProperty(110, "nprobes", bind_data.nprobes);
+  serializer.WriteProperty(111, "refine_factor", bind_data.refine_factor);
+  serializer.WriteProperty(112, "use_index", bind_data.use_index);
+  serializer.WriteProperty(113, "alpha", bind_data.alpha);
+  serializer.WriteProperty(114, "oversample_factor",
+                           bind_data.oversample_factor);
+  serializer.WriteProperty(115, "k", bind_data.k);
+  serializer.WriteProperty(116, "dataset_version", bind_data.dataset_version);
+  serializer.WriteProperty(117, "names", bind_data.names);
+  serializer.WriteProperty(118, "types", bind_data.types);
+  if (bind_data.namespace_backed) {
+    auto &cfg = bind_data.namespace_config;
+    serializer.WriteProperty(119, "namespace_kind",
+                             static_cast<uint8_t>(cfg.kind));
+    serializer.WriteProperty(120, "namespace_root", cfg.root);
+    serializer.WriteProperty(121, "namespace_endpoint", cfg.endpoint);
+    serializer.WriteProperty(122, "namespace_table_id", cfg.table_id);
+    serializer.WriteProperty(123, "namespace_delimiter", cfg.delimiter);
+    serializer.WriteProperty(124, "namespace_display_uri", cfg.display_uri);
+    serializer.WriteProperty(125, "namespace_replay_secret_name",
+                             cfg.replay_secret_name);
+  }
+  serializer.WriteProperty(126, "dataset_generation_id",
+                           bind_data.dataset_generation_id);
+  serializer.WriteProperty(127, "lance_filter_ir_parts",
+                           bind_data.lance_pushed_filter_ir_parts);
+  serializer.WriteProperty(128, "complex_filter_pushdown_failed",
+                           bind_data.complex_filter_pushdown_failed);
+}
+
+static unique_ptr<FunctionData>
+LanceSearchDeserialize(Deserializer &deserializer, TableFunction &) {
+  auto result = make_uniq<LanceSearchBindData>();
+  auto &context = deserializer.Get<ClientContext &>();
+  result->task_cpu_slots = MaxValue<idx_t>(1, context.db->NumberOfThreads());
+  result->mode = static_cast<LanceSearchMode>(
+      deserializer.ReadProperty<uint8_t>(100, "mode"));
+  result->file_path = deserializer.ReadProperty<string>(101, "file_path");
+  result->prefilter = deserializer.ReadProperty<bool>(102, "prefilter");
+  result->namespace_backed =
+      deserializer.ReadProperty<bool>(103, "namespace_backed");
+  result->namespace_filter =
+      deserializer.ReadProperty<string>(104, "namespace_filter");
+  result->text_column = deserializer.ReadProperty<string>(105, "text_column");
+  result->query = deserializer.ReadProperty<string>(106, "query");
+  result->vector_column =
+      deserializer.ReadProperty<string>(107, "vector_column");
+  result->vector_query =
+      deserializer.ReadProperty<vector<float>>(108, "vector_query");
+  result->text_query = deserializer.ReadProperty<string>(109, "text_query");
+  result->nprobes = deserializer.ReadProperty<uint64_t>(110, "nprobes");
+  result->refine_factor =
+      deserializer.ReadProperty<uint64_t>(111, "refine_factor");
+  result->use_index = deserializer.ReadProperty<bool>(112, "use_index");
+  result->alpha = deserializer.ReadProperty<float>(113, "alpha");
+  result->oversample_factor =
+      deserializer.ReadProperty<uint32_t>(114, "oversample_factor");
+  result->k = deserializer.ReadProperty<uint64_t>(115, "k");
+  result->dataset_version =
+      deserializer.ReadProperty<uint64_t>(116, "dataset_version");
+  result->names = deserializer.ReadProperty<vector<string>>(117, "names");
+  result->types = deserializer.ReadProperty<vector<LogicalType>>(118, "types");
+  if (result->namespace_backed) {
+    auto &cfg = result->namespace_config;
+    cfg.kind = static_cast<LanceNamespaceKind>(
+        deserializer.ReadProperty<uint8_t>(119, "namespace_kind"));
+    cfg.root = deserializer.ReadProperty<string>(120, "namespace_root");
+    cfg.endpoint = deserializer.ReadProperty<string>(121, "namespace_endpoint");
+    cfg.table_id = deserializer.ReadProperty<string>(122, "namespace_table_id");
+    cfg.delimiter =
+        deserializer.ReadProperty<string>(123, "namespace_delimiter");
+    cfg.display_uri =
+        deserializer.ReadProperty<string>(124, "namespace_display_uri");
+    cfg.replay_secret_name =
+        deserializer.ReadProperty<string>(125, "namespace_replay_secret_name");
+    // Storage options, auth values and headers remain outside the plan.
+  }
+  result->dataset_generation_id =
+      deserializer.ReadProperty<string>(126, "dataset_generation_id");
+  result->lance_pushed_filter_ir_parts =
+      deserializer.ReadProperty<vector<string>>(127, "lance_filter_ir_parts");
+  result->complex_filter_pushdown_failed =
+      deserializer.ReadProperty<bool>(128, "complex_filter_pushdown_failed");
+  if (result->namespace_backed) {
+    if (result->dataset_version == 0) {
+      throw SerializationException("Serialized Lance namespace search is "
+                                   "missing its fixed dataset version");
+    }
+  } else {
+    if (result->dataset_version == 0) {
+      throw SerializationException(
+          "Serialized Lance search is missing its fixed dataset version");
+    }
+    if (result->dataset_generation_id.empty()) {
+      throw SerializationException(
+          "Serialized Lance search is missing its fixed dataset generation");
+    }
+    result->dataset_entry = LanceGetOrOpenDatasetEntryAtVersion(
+        context, result->file_path, result->dataset_version,
+        result->dataset_generation_id, &result->dataset_cache_hit);
+    result->dataset =
+        result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
+    if (!result->dataset ||
+        lance_dataset_version(result->dataset) != result->dataset_version) {
+      throw IOException("Failed to reopen fixed Lance search snapshot: " +
+                        result->file_path + LanceFormatErrorSuffix());
+    }
+  }
+  PopulateSearchSchemaFromTypes(context, result->schema_root,
+                                result->arrow_table, result->names,
+                                result->types);
+  return std::move(result);
+}
+
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   TableFunction fts(
       "lance_fts",
@@ -1560,8 +2138,12 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.filter_pushdown = true;
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
+  fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
   fts.to_string = LanceSearchToString;
   fts.dynamic_to_string = LanceSearchDynamicToString;
+  fts.serialize = LanceSearchSerialize;
+  fts.deserialize = LanceSearchDeserialize;
+  fts.SetDistributedScanCallbacks(LanceSearchDistributedScanCallbacks());
   loader.RegisterFunction(fts);
 }
 
@@ -1578,8 +2160,12 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
+    fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
     fun.to_string = LanceSearchToString;
     fun.dynamic_to_string = LanceSearchDynamicToString;
+    fun.serialize = LanceSearchSerialize;
+    fun.deserialize = LanceSearchDeserialize;
+    fun.SetDistributedScanCallbacks(LanceSearchDistributedScanCallbacks());
   };
 
   TableFunction hybrid_f32("lance_hybrid_search",

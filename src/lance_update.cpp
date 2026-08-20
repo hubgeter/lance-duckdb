@@ -195,6 +195,8 @@ public:
     }
     state.emitted = true;
 
+    RequireLanceMutationSlot(context.client, table.catalog);
+
     if (set_columns.size() != set_expr_irs.size()) {
       throw InternalException("Lance UPDATE has mismatched SET columns/values");
     }

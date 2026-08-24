@@ -15,6 +15,11 @@ LanceReplacementScan(ClientContext &, ReplacementScanInput &input,
   if (!StringUtil::EndsWith(table_name, ".lance")) {
     return nullptr;
   }
+  if (table_name.find_first_of("*?[") != string::npos) {
+    throw InvalidInputException(
+        "Lance replacement scans do not support glob patterns: " + table_name +
+        ". Open one dataset path at a time.");
+  }
 
   auto table_function = make_uniq<TableFunctionRef>();
   auto function_expr = make_uniq<FunctionExpression>(

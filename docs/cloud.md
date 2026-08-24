@@ -8,6 +8,9 @@ This integration is intentionally thin:
 - You configure credentials and object store settings using `CREATE SECRET (TYPE LANCE, ...)`.
 - The extension reads the matching secret by URI prefix (`SCOPE`) and forwards the key/value pairs to Lance as
   `storage_options`.
+- For `s3://` paths without a matching `TYPE LANCE` secret, the extension also maps DuckDB's current `s3_*` settings
+  to Lance storage options. This lets trusted connection/session configuration be replayed on distributed workers
+  without serializing DuckDB secret objects.
 
 For the upstream Lance object store options and provider behavior, see https://lance.org/guide/object_store/.
 
@@ -132,6 +135,17 @@ CREATE SECRET (
   VIRTUAL_HOSTED_STYLE_REQUEST false,
   ALLOW_HTTP true
 );
+```
+
+The equivalent connection settings are useful when the connection is snapshotted for distributed execution:
+
+```sql
+SET s3_access_key_id = 'minioadmin';
+SET s3_secret_access_key = 'minioadmin';
+SET s3_region = 'us-east-1';
+SET s3_endpoint = '127.0.0.1:9000';
+SET s3_use_ssl = false;
+SET s3_url_style = 'path';
 ```
 
 ## Google Cloud Storage (`gs://`)

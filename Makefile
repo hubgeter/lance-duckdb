@@ -1,20 +1,19 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-# Configuration of extension
 EXT_NAME=lance
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
-
 CORE_EXTENSIONS=''
 
-# Default build: skip DuckDB's parquet extension.
-# Override by providing EXT_FLAGS that already contains -DSKIP_EXTENSIONS=...
 ifeq (,$(findstring -DSKIP_EXTENSIONS=,$(EXT_FLAGS)))
 	EXT_FLAGS += -DSKIP_EXTENSIONS=parquet
 endif
-
-# Include the Makefile from extension-ci-tools
+# The ordinary DuckDB targets remain available when the optional Vane tooling
+# submodule has not been checked out.
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
+-include vane-extension-ci-tools/makefiles/vane_extension.Makefile
 
-.PHONY: configure_ci
-configure_ci:
+.PHONY: configure_ci vane_configure_ci
+configure_ci: vane_configure_ci
+
+vane_configure_ci:
 	@bash scripts/configure_ci.sh

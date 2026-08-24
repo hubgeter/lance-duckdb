@@ -18,4 +18,24 @@ SELECT * FROM 'test/data/test_data.lance' LIMIT 1;
 statement error
 SELECT * FROM 'dummy_path.lance';
 ----
-IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
+IO Error: Failed to open Lance dataset:
+
+# A path-like replacement scan is one Lance dataset, never a file glob.
+statement error
+SELECT * FROM 'test/data/*.lance';
+----
+Invalid Input Error: Lance replacement scans do not support glob patterns: test/data/*.lance. Open one dataset path at a time.
+
+# C strings cross the C++/Rust ABI; embedded NUL bytes must fail instead of
+# silently retargeting the dataset to the truncated prefix.
+statement error
+SELECT * FROM __lance_scan('dummy' || chr(0) || '.lance');
+----
+Invalid Input Error: Lance dataset path must not contain a NUL byte
+
+# Lance reserves dots in top-level field names for nested field paths.
+statement error
+COPY (SELECT 1 AS "literal.dot", 2 AS plain)
+TO 'test/.tmp/scan_dotted_column.lance' (FORMAT lance, mode 'overwrite');
+----
+IO Error: Failed to finalize Lance dataset write

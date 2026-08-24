@@ -6,9 +6,50 @@
 namespace duckdb {
 
 static bool ShouldRedactLanceStorageOption(const string &key) {
-  return StringUtil::Contains(StringUtil::Lower(key), "secret") ||
-         StringUtil::Contains(StringUtil::Lower(key), "password") ||
-         StringUtil::Contains(StringUtil::Lower(key), "token");
+  static const case_insensitive_set_t sensitive_keys = {
+      "access_key_id",
+      "secret_access_key",
+      "session_token",
+      "aws_access_key_id",
+      "aws_secret_access_key",
+      "aws_session_token",
+      "google_storage_token",
+      "service_account",
+      "service_account_key",
+      "application_credentials",
+      "google_application_credentials",
+      "google_service_account",
+      "google_service_account_key",
+      "account_key",
+      "sas_key",
+      "sas_token",
+      "bearer_token",
+      "access_key",
+      "api_key",
+      "azure_storage_account_key",
+      "azure_client_secret",
+      "azure_storage_sas_key",
+      "azure_storage_sas_token",
+      "azure_storage_token",
+      "azure_federated_token_file",
+      "oss_access_key_id",
+      "oss_secret_access_key",
+      "hf_token",
+      "private_key",
+      "client_secret",
+  };
+  auto normalized = StringUtil::Lower(key);
+  return sensitive_keys.find(normalized) != sensitive_keys.end() ||
+         StringUtil::Contains(normalized, "secret") ||
+         StringUtil::Contains(normalized, "password") ||
+         StringUtil::Contains(normalized, "token") ||
+         StringUtil::Contains(normalized, "private_key") ||
+         StringUtil::Contains(normalized, "access_key") ||
+         StringUtil::Contains(normalized, "account_key") ||
+         StringUtil::Contains(normalized, "api_key") ||
+         StringUtil::Contains(normalized, "client_key") ||
+         StringUtil::Contains(normalized, "credential") ||
+         StringUtil::Contains(normalized, "authorization");
 }
 
 static unique_ptr<BaseSecret>

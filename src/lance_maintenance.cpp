@@ -11,7 +11,9 @@
 #include "duckdb/parser/qualified_name.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
+#include "lance_lease.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
 
@@ -36,15 +38,66 @@ namespace duckdb {
 // Lance table (plain file path, or table not yet in the catalog for
 // any reason), we transparently fall back to LanceOpenDataset() on
 // the resolved URI -- preserving the original "open by path" contract.
-static void *TryOpenDatasetForMaintenanceInput(ClientContext &context,
-                                               const string &input_str,
+static void *TryOpenDatasetForMaintenanceTable(ClientContext &context,
+                                               LanceTableEntry *lance_entry,
                                                string &out_display_uri) {
-  auto *lance_entry = TryResolveLanceTableEntry(context, input_str);
   if (!lance_entry) {
     return nullptr;
   }
   return LanceOpenDatasetForTable(context, *lance_entry, out_display_uri);
 }
+
+static void RequireLanceMaintenanceAutocommit(ClientContext &context,
+                                              const string &operation) {
+  if (!context.transaction.IsAutoCommit()) {
+    throw NotImplementedException(
+        operation +
+        " does not support explicit transactions because its Lance commit "
+        "cannot be rolled back by DuckDB");
+  }
+}
+
+static string BuildLanceMaintenanceDatasetCacheKey(ClientContext &context,
+                                                   LanceTableEntry *table,
+                                                   const string &dataset_uri) {
+  if (table) {
+    return LanceBuildDatasetCacheKeyForTable(context, *table);
+  }
+  return LanceBuildPathDatasetCacheKey(context, dataset_uri);
+}
+
+template <class FUNC>
+static void FinishCommittedLanceMaintenanceResult(const string &operation,
+                                                  FUNC &&finish) {
+  try {
+    finish();
+  } catch (const std::exception &error) {
+    throw IOException(operation +
+                      " committed, but preparing its SQL result failed: " +
+                      string(error.what()) + " (code=55)");
+  } catch (...) {
+    throw IOException(operation +
+                      " committed, but preparing its SQL result failed with "
+                      "an unknown error (code=55)");
+  }
+}
+
+class ScopedLanceString {
+public:
+  explicit ScopedLanceString(const char *value_p) : value(value_p) {}
+  ScopedLanceString(const ScopedLanceString &) = delete;
+  ScopedLanceString &operator=(const ScopedLanceString &) = delete;
+  ~ScopedLanceString() {
+    if (value) {
+      lance_free_string(value);
+    }
+  }
+
+  const char *Get() const { return value; }
+
+private:
+  const char *value;
+};
 
 static constexpr const char *LANCE_AUTO_CLEANUP_INTERVAL_KEY =
     "lance.auto_cleanup.interval";
@@ -53,29 +106,6 @@ static constexpr const char *LANCE_AUTO_CLEANUP_OLDER_THAN_KEY =
 static constexpr const char *LANCE_AUTO_CLEANUP_RETAIN_VERSIONS_KEY =
     "lance.auto_cleanup.retain_versions";
 static string EscapeJsonString(const string &s);
-
-static vector<pair<string, string>> ParseTsvRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance dataset config" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
 
 enum class LanceMaintenanceOp : uint8_t {
   COMPACT = 1,
@@ -96,7 +126,7 @@ struct LanceMaintenanceBindData final : public FunctionData {
   // Original first-argument literal preserved so the executor can re-resolve
   // it as a Lance catalog table entry when the registered resolver produced
   // a virtual URI (e.g. namespace-backed tables).  See
-  // TryOpenDatasetForMaintenanceInput().
+  // TryOpenDatasetForMaintenanceTable().
   string input_str;
   LanceMaintenanceOp op;
   string options_json;
@@ -117,6 +147,7 @@ struct LanceMaintenanceBindData final : public FunctionData {
 
 struct LanceMaintenanceGlobalState final : public GlobalTableFunctionState {
   bool finished = false;
+  unique_ptr<LanceLease> vacuum_lease;
 };
 
 static unique_ptr<GlobalTableFunctionState>
@@ -132,11 +163,16 @@ LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
     throw BinderException("invalid argument count");
   }
 
+  RequireLanceMaintenanceAutocommit(context, "Lance maintenance");
+
   auto dataset_uri = ResolveLanceDatasetUri(
       context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
       "__lance_maintenance");
   string input_str =
       input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance maintenance");
+  }
 
   string options_json;
   string index_name;
@@ -160,6 +196,8 @@ LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
   default:
     throw InternalException("unknown maintenance op");
   }
+  ValidateLanceCString(options_json, "Lance maintenance options");
+  ValidateLanceCString(index_name, "Lance index name");
 
   return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
                   LogicalType::VARCHAR};
@@ -228,8 +266,11 @@ static void LanceMaintenanceFunc(ClientContext &context,
       bind_data.options_json.empty() ? nullptr : bind_data.options_json.c_str();
 
   string display_uri = bind_data.dataset_uri;
-  void *dataset = TryOpenDatasetForMaintenanceInput(
-      context, bind_data.input_str, display_uri);
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  auto cache_key = BuildLanceMaintenanceDatasetCacheKey(context, table,
+                                                        bind_data.dataset_uri);
+  void *dataset =
+      TryOpenDatasetForMaintenanceTable(context, table, display_uri);
   if (!dataset) {
     display_uri = bind_data.dataset_uri;
     dataset = LanceOpenDataset(context, bind_data.dataset_uri);
@@ -244,25 +285,35 @@ static void LanceMaintenanceFunc(ClientContext &context,
   string op_name;
   switch (bind_data.op) {
   case LanceMaintenanceOp::COMPACT:
+    op_name = "compact";
+    gstate.vacuum_lease = LanceLease::AcquireForDataset(
+        dataset, LanceLeaseKind::Vacuum,
+        "maintenance:" + op_name + ":" + display_uri);
     rc = lance_dataset_compact_files_with_options(dataset, options_ptr,
                                                   &metrics_ptr);
-    op_name = "compact";
     break;
   case LanceMaintenanceOp::CLEANUP:
+    op_name = "cleanup";
+    gstate.vacuum_lease = LanceLease::AcquireForDataset(
+        dataset, LanceLeaseKind::Vacuum,
+        "maintenance:" + op_name + ":" + display_uri);
     rc = lance_dataset_cleanup_old_versions_with_options(dataset, options_ptr,
                                                          &metrics_ptr);
-    op_name = "cleanup";
     break;
   case LanceMaintenanceOp::OPTIMIZE_INDEX:
+    op_name = "optimize_index";
+    gstate.vacuum_lease = LanceLease::AcquireForDataset(
+        dataset, LanceLeaseKind::Vacuum,
+        "maintenance:" + op_name + ":" + display_uri);
     rc = lance_dataset_optimize_index_with_options(
         dataset, bind_data.index_name.c_str(), options_ptr, &metrics_ptr);
-    op_name = "optimize_index";
     break;
   default:
     rc = -1;
     break;
   }
   lance_close_dataset(dataset);
+  ScopedLanceString metrics(metrics_ptr);
 
   if (rc != 0) {
     throw IOException("Failed to execute Lance maintenance operation '" +
@@ -270,16 +321,18 @@ static void LanceMaintenanceFunc(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
-  string metrics_json = "{}";
-  if (metrics_ptr) {
-    metrics_json = metrics_ptr;
-    lance_free_string(metrics_ptr);
-  }
-
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value(op_name));
-  output.SetValue(1, 0, Value(display_uri));
-  output.SetValue(2, 0, Value(metrics_json));
+  LanceInvalidateDatasetCache(context, cache_key);
+  FinishCommittedLanceMaintenanceResult(
+      "Lance maintenance operation '" + op_name + "'", [&] {
+        string metrics_json = "{}";
+        if (metrics.Get()) {
+          metrics_json = metrics.Get();
+        }
+        output.SetCardinality(1);
+        output.SetValue(0, 0, Value(op_name));
+        output.SetValue(1, 0, Value(display_uri));
+        output.SetValue(2, 0, Value(metrics_json));
+      });
 }
 
 struct LanceAutoCleanupSetBindData final : public FunctionData {
@@ -353,11 +406,17 @@ LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
         "retain_versions, unset)");
   }
 
+  RequireLanceMaintenanceAutocommit(context,
+                                    "Lance auto-cleanup configuration");
+
   auto dataset_uri = ResolveLanceDatasetUri(
       context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
       "__lance_set_auto_cleanup");
   string input_str =
       input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance auto-cleanup configuration");
+  }
 
   bool unset = false;
   if (!input.inputs[4].IsNull()) {
@@ -386,6 +445,7 @@ LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
     if (older_than.empty()) {
       throw BinderException("auto cleanup older_than cannot be empty");
     }
+    ValidateLanceCString(older_than, "Lance auto cleanup older_than");
 
     if (!input.inputs[3].IsNull()) {
       retain_versions = input.inputs[3]
@@ -424,15 +484,6 @@ LanceShowAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
                                                  std::move(input_str));
 }
 
-static void UpdateDatasetConfigOrThrow(void *dataset, const string &dataset_uri,
-                                       const char *key, const char *value) {
-  auto rc = lance_dataset_update_config(dataset, key, value);
-  if (rc != 0) {
-    throw IOException("Failed to update Lance maintenance config on dataset: " +
-                      dataset_uri + LanceFormatErrorSuffix());
-  }
-}
-
 static void LanceSetAutoCleanupFunc(ClientContext &context,
                                     TableFunctionInput &data,
                                     DataChunk &output) {
@@ -445,8 +496,11 @@ static void LanceSetAutoCleanupFunc(ClientContext &context,
 
   auto &bind_data = data.bind_data->Cast<LanceAutoCleanupSetBindData>();
   string display_uri = bind_data.dataset_uri;
-  void *dataset = TryOpenDatasetForMaintenanceInput(
-      context, bind_data.input_str, display_uri);
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  auto cache_key = BuildLanceMaintenanceDatasetCacheKey(context, table,
+                                                        bind_data.dataset_uri);
+  void *dataset =
+      TryOpenDatasetForMaintenanceTable(context, table, display_uri);
   if (!dataset) {
     display_uri = bind_data.dataset_uri;
     dataset = LanceOpenDataset(context, bind_data.dataset_uri);
@@ -458,57 +512,46 @@ static void LanceSetAutoCleanupFunc(ClientContext &context,
 
   string op_name;
   string metrics_json;
-  try {
-    if (bind_data.unset) {
-      UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                 LANCE_AUTO_CLEANUP_INTERVAL_KEY, nullptr);
-      UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                 LANCE_AUTO_CLEANUP_OLDER_THAN_KEY, nullptr);
-      UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                 LANCE_AUTO_CLEANUP_RETAIN_VERSIONS_KEY,
-                                 nullptr);
-      op_name = "unset_auto_cleanup";
-      metrics_json = "{\"enabled\":false}";
-    } else {
-      auto interval = to_string(bind_data.interval);
-      UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                 LANCE_AUTO_CLEANUP_INTERVAL_KEY,
-                                 interval.c_str());
-      UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                 LANCE_AUTO_CLEANUP_OLDER_THAN_KEY,
-                                 bind_data.older_than.c_str());
-
-      if (bind_data.has_retain_versions) {
-        auto retain_versions = to_string(bind_data.retain_versions);
-        UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                   LANCE_AUTO_CLEANUP_RETAIN_VERSIONS_KEY,
-                                   retain_versions.c_str());
-      } else {
-        UpdateDatasetConfigOrThrow(dataset, display_uri,
-                                   LANCE_AUTO_CLEANUP_RETAIN_VERSIONS_KEY,
-                                   nullptr);
-      }
-
-      op_name = "set_auto_cleanup";
-      metrics_json = "{\"enabled\":true,\"interval\":" + interval +
-                     ",\"older_than\":\"" +
-                     EscapeJsonString(bind_data.older_than) + "\"";
-      if (bind_data.has_retain_versions) {
-        metrics_json +=
-            ",\"retain_versions\":" + to_string(bind_data.retain_versions);
-      }
-      metrics_json += "}";
+  auto interval = to_string(bind_data.interval);
+  auto retain_versions = to_string(bind_data.retain_versions);
+  if (bind_data.unset) {
+    op_name = "unset_auto_cleanup";
+    metrics_json = "{\"enabled\":false}";
+  } else {
+    op_name = "set_auto_cleanup";
+    metrics_json = "{\"enabled\":true,\"interval\":" + interval +
+                   ",\"older_than\":\"" +
+                   EscapeJsonString(bind_data.older_than) + "\"";
+    if (bind_data.has_retain_versions) {
+      metrics_json += ",\"retain_versions\":" + retain_versions;
     }
-  } catch (...) {
-    lance_close_dataset(dataset);
-    throw;
+    metrics_json += "}";
   }
-  lance_close_dataset(dataset);
+  const char *keys[] = {LANCE_AUTO_CLEANUP_INTERVAL_KEY,
+                        LANCE_AUTO_CLEANUP_OLDER_THAN_KEY,
+                        LANCE_AUTO_CLEANUP_RETAIN_VERSIONS_KEY};
+  const char *values[] = {
+      bind_data.unset ? nullptr : interval.c_str(),
+      bind_data.unset ? nullptr : bind_data.older_than.c_str(),
+      !bind_data.unset && bind_data.has_retain_versions
+          ? retain_versions.c_str()
+          : nullptr,
+  };
+  auto rc = lance_dataset_update_config_entries(dataset, keys, values, 3);
+  if (rc != 0) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to update Lance maintenance config on dataset: " +
+                      display_uri + LanceFormatErrorSuffix());
+  }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value(op_name));
-  output.SetValue(1, 0, Value(display_uri));
-  output.SetValue(2, 0, Value(metrics_json));
+  lance_close_dataset(dataset);
+  LanceInvalidateDatasetCache(context, cache_key);
+  FinishCommittedLanceMaintenanceResult("Lance maintenance configuration", [&] {
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value(op_name));
+    output.SetValue(1, 0, Value(display_uri));
+    output.SetValue(2, 0, Value(metrics_json));
+  });
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -516,8 +559,9 @@ LanceShowAutoCleanupInitGlobal(ClientContext &context,
                                TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceAutoCleanupShowBindData>();
   string display_uri = bind_data.dataset_uri;
-  void *dataset = TryOpenDatasetForMaintenanceInput(
-      context, bind_data.input_str, display_uri);
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  void *dataset =
+      TryOpenDatasetForMaintenanceTable(context, table, display_uri);
   if (!dataset) {
     display_uri = bind_data.dataset_uri;
     dataset = LanceOpenDataset(context, bind_data.dataset_uri);
@@ -529,7 +573,8 @@ LanceShowAutoCleanupInitGlobal(ClientContext &context,
 
   vector<pair<string, string>> rows;
   try {
-    auto all_configs = ParseTsvRows(lance_dataset_list_config(dataset));
+    auto all_configs = ParseLanceKeyValueRows(
+        lance_dataset_list_config(dataset), "Lance dataset config");
     unordered_map<string, string> filtered;
     for (auto &kv : all_configs) {
       if (kv.first == LANCE_AUTO_CLEANUP_INTERVAL_KEY ||
@@ -1027,6 +1072,58 @@ static bool TryParseIdentifier(const string &sql, string &out_ident,
   return true;
 }
 
+static bool TryParseQualifiedIdentifier(const string &sql, string &out_sql,
+                                        idx_t &out_consumed) {
+  out_sql.clear();
+  out_consumed = 0;
+  idx_t i = 0;
+  bool saw_part = false;
+  while (i < sql.size()) {
+    if (sql[i] == '"') {
+      i++;
+      bool closed = false;
+      while (i < sql.size()) {
+        if (sql[i] != '"') {
+          i++;
+          continue;
+        }
+        if (i + 1 < sql.size() && sql[i + 1] == '"') {
+          i += 2;
+          continue;
+        }
+        i++;
+        closed = true;
+        break;
+      }
+      if (!closed) {
+        return false;
+      }
+    } else {
+      auto start = i;
+      while (i < sql.size() && sql[i] != '.' && IsIdentChar(sql[i])) {
+        i++;
+      }
+      if (i == start) {
+        return false;
+      }
+    }
+    saw_part = true;
+    if (i >= sql.size() || sql[i] != '.') {
+      break;
+    }
+    i++;
+    if (i >= sql.size()) {
+      return false;
+    }
+  }
+  if (!saw_part) {
+    return false;
+  }
+  out_sql = sql.substr(0, i);
+  out_consumed = i;
+  return true;
+}
+
 struct LanceMaintenanceParseData final : public ParserExtensionParseData {
   explicit LanceMaintenanceParseData(LanceMaintenanceStmtKind kind_p)
       : kind(kind_p) {}
@@ -1100,7 +1197,7 @@ static bool TryParseTarget(string &rest, bool &target_is_path,
   }
 
   string ident;
-  if (!TryParseIdentifier(rest, ident, consumed)) {
+  if (!TryParseQualifiedIdentifier(rest, ident, consumed)) {
     out_error = "expected dataset path or table identifier";
     return false;
   }
@@ -1317,7 +1414,7 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
 
   string target;
   if (parse_data->target_is_path) {
-    target = parse_data->dataset_uri;
+    target = "path:" + parse_data->dataset_uri;
   } else {
     auto qname = QualifiedName::Parse(parse_data->target_sql);
     if (qname.catalog.empty()) {
@@ -1326,7 +1423,11 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     if (qname.schema.empty()) {
       qname.schema = DEFAULT_SCHEMA;
     }
-    target = qname.catalog + "." + qname.schema + "." + qname.name;
+    // Preserve the parser's path-vs-table decision and re-quote every
+    // component. Otherwise a catalog or table name containing '.' is
+    // reinterpreted as extra qualification (or, after resolution fails, as a
+    // filesystem path) by the internal maintenance table function.
+    target = "table:" + qname.ToString();
   }
 
   ParserExtensionPlanResult result;

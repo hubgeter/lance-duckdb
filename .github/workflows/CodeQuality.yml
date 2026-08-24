@@ -1,11 +1,9 @@
 name: Extension Code Quality
 on:
   pull_request:
-    paths-ignore:
-      - "**.md"
+    paths-ignore: ["**.md"]
   push:
-    paths-ignore:
-      - "**.md"
+    paths-ignore: ["**.md"]
   workflow_dispatch:
 
 concurrency:
@@ -15,8 +13,8 @@ concurrency:
 jobs:
   code-quality:
     name: Code Quality
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@72e76e99cd7fee45a99739cd118ec2db64e034ec
     with:
       extension_name: lance
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      duckdb_version: 6367663157416c79e64875d96156d80059f2dc07
+      ci_tools_version: 72e76e99cd7fee45a99739cd118ec2db64e034ec

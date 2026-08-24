@@ -1,7 +1,5 @@
 #include "lance_filter_ir.hpp"
 
-#include "lance_common.hpp"
-#include "lance_expr_ir.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
@@ -13,12 +11,14 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "lance_common.hpp"
+#include "lance_expr_ir.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -26,6 +26,13 @@
 namespace duckdb {
 
 bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
+  // DuckDB orders NaN above every finite floating-point value and considers
+  // NaN equal to itself. Arrow/DataFusion comparisons use IEEE semantics, so
+  // pushing any FLOAT/DOUBLE predicate can irreversibly discard rows before
+  // DuckDB gets a chance to apply its own comparison rules.
+  if (type.id() == LogicalTypeId::FLOAT || type.id() == LogicalTypeId::DOUBLE) {
+    return false;
+  }
   return LanceExprIRSupportsLogicalType(type);
 }
 
@@ -456,6 +463,17 @@ ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const TableFunctionInitInput &input, bool exclude_computed_columns) {
+  return BuildLanceTableFilterIRParts(names, types, input,
+                                      exclude_computed_columns
+                                          ? LanceComputedSearchColumns::Hybrid
+                                          : LanceComputedSearchColumns::None);
+}
+
+LanceFilterIRBuildResult
+BuildLanceTableFilterIRParts(const vector<string> &names,
+                             const vector<LogicalType> &types,
+                             const TableFunctionInitInput &input,
+                             LanceComputedSearchColumns computed_columns) {
   LanceFilterIRBuildResult result;
   if (!input.filters || input.filters->filters.empty()) {
     return result;
@@ -483,7 +501,7 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
       result.all_prefilterable_filters_pushed = false;
       continue;
     }
-    if (exclude_computed_columns && IsComputedSearchColumn(names[col_id])) {
+    if (IsComputedSearchColumn(names[col_id], computed_columns)) {
       result.all_filters_pushed = false;
       continue;
     }
@@ -512,12 +530,11 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
   return result;
 }
 
-static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
-                                         const vector<string> &names,
-                                         const vector<LogicalType> &types,
-                                         bool exclude_computed_columns,
-                                         const Expression &expr,
-                                         string &out_ir) {
+static bool
+TryBuildLanceExprColumnRefIR(const LogicalGet &get, const vector<string> &names,
+                             const vector<LogicalType> &types,
+                             LanceComputedSearchColumns computed_columns,
+                             const Expression &expr, string &out_ir) {
   vector<string> segments;
   LogicalType leaf_type;
 
@@ -561,13 +578,10 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
           return true;
         }
         if (children.size() > 1) {
-          for (auto &child : children) {
-            if (!child.GetChildIndexes().empty()) {
-              return false;
-            }
-            child_path.push_back(child.GetPrimaryIndex());
-          }
-          return true;
+          // Multiple children describe sibling projection hints, not one
+          // nested column path. Decline expression pushdown instead of
+          // accidentally encoding parent.child1.child2.
+          return false;
         }
         auto &child = children[0];
         child_path.push_back(child.GetPrimaryIndex());
@@ -621,13 +635,7 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
           return true;
         }
         if (children.size() > 1) {
-          for (auto &child : children) {
-            if (!child.GetChildIndexes().empty()) {
-              return false;
-            }
-            child_path.push_back(child.GetPrimaryIndex());
-          }
-          return true;
+          return false;
         }
         auto &child = children[0];
         child_path.push_back(child.GetPrimaryIndex());
@@ -735,7 +743,7 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
   if (segments.empty()) {
     return false;
   }
-  if (exclude_computed_columns && IsComputedSearchColumn(segments[0])) {
+  if (IsComputedSearchColumn(segments[0], computed_columns)) {
     return false;
   }
   if (!LanceFilterIRSupportsLogicalType(leaf_type)) {
@@ -749,17 +757,29 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const vector<LogicalType> &types,
                                bool exclude_computed_columns,
                                const Expression &expr, string &out_ir) {
+  return TryBuildLanceExprFilterIR(get, names, types,
+                                   exclude_computed_columns
+                                       ? LanceComputedSearchColumns::Hybrid
+                                       : LanceComputedSearchColumns::None,
+                                   expr, out_ir);
+}
+
+bool TryBuildLanceExprFilterIR(const LogicalGet &get,
+                               const vector<string> &names,
+                               const vector<LogicalType> &types,
+                               LanceComputedSearchColumns computed_columns,
+                               const Expression &expr, string &out_ir) {
   switch (expr.expression_class) {
   case ExpressionClass::BOUND_COLUMN_REF:
   case ExpressionClass::BOUND_REF:
-    return TryBuildLanceExprColumnRefIR(get, names, types,
-                                        exclude_computed_columns, expr, out_ir);
+    return TryBuildLanceExprColumnRefIR(get, names, types, computed_columns,
+                                        expr, out_ir);
   case ExpressionClass::BOUND_FUNCTION: {
     auto &func = expr.Cast<BoundFunctionExpression>();
     if (func.function.name == "struct_extract" ||
         func.function.name == "struct_extract_at") {
-      return TryBuildLanceExprColumnRefIR(
-          get, names, types, exclude_computed_columns, expr, out_ir);
+      return TryBuildLanceExprColumnRefIR(get, names, types, computed_columns,
+                                          expr, out_ir);
     }
 
     if (func.function.name == "lower" || func.function.name == "upper") {
@@ -767,8 +787,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                      *func.children[0], input_ir)) {
         return false;
       }
@@ -784,8 +803,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                      *func.children[0], input_ir)) {
         return false;
       }
@@ -818,8 +836,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       }
 
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                      *func.children[0], input_ir)) {
         return false;
       }
@@ -881,7 +898,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     }
 
     string input_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+    if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                    *func.children[0], input_ir)) {
       return false;
     }
@@ -919,7 +936,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   }
   case ExpressionClass::BOUND_CAST: {
     auto &cast = expr.Cast<BoundCastExpression>();
-    if (cast.try_cast) {
+    if (cast.try_cast || !cast.child) {
       return false;
     }
     if (cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
@@ -939,10 +956,13 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     if (!TryEncodeLanceFilterIRComparisonOp(cmp.type, op)) {
       return false;
     }
+    if (!cmp.left || !cmp.right) {
+      return false;
+    }
     string lhs_ir, rhs_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+    if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                    *cmp.left, lhs_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+        !TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                    *cmp.right, rhs_ir)) {
       return false;
     }
@@ -961,9 +981,12 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     vector<string> children;
     children.reserve(conj.children.size());
     for (auto &child : conj.children) {
+      if (!child) {
+        return false;
+      }
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(
-              get, names, types, exclude_computed_columns, *child, child_ir)) {
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
+                                     *child, child_ir)) {
         return false;
       }
       children.push_back(std::move(child_ir));
@@ -973,13 +996,12 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   case ExpressionClass::BOUND_OPERATOR: {
     auto &op = expr.Cast<BoundOperatorExpression>();
     if (op.type == ExpressionType::OPERATOR_NOT) {
-      if (op.children.size() != 1) {
+      if (op.children.size() != 1 || !op.children[0]) {
         return false;
       }
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *op.children[0],
-                                     child_ir)) {
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
+                                     *op.children[0], child_ir)) {
         return false;
       }
       return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::NOT, child_ir,
@@ -987,13 +1009,12 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     }
     if (op.type == ExpressionType::OPERATOR_IS_NULL ||
         op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-      if (op.children.size() != 1) {
+      if (op.children.size() != 1 || !op.children[0]) {
         return false;
       }
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *op.children[0],
-                                     child_ir)) {
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
+                                     *op.children[0], child_ir)) {
         return false;
       }
       return TryEncodeLanceFilterIRUnary(
@@ -1004,20 +1025,19 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     }
     if (op.type == ExpressionType::COMPARE_IN ||
         op.type == ExpressionType::COMPARE_NOT_IN) {
-      if (op.children.size() < 2) {
+      if (op.children.size() < 2 || !op.children[0]) {
         return false;
       }
       string lhs_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *op.children[0],
-                                     lhs_ir)) {
+      if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
+                                     *op.children[0], lhs_ir)) {
         return false;
       }
       vector<string> values;
       values.reserve(op.children.size() - 1);
       for (idx_t i = 1; i < op.children.size(); i++) {
-        if (op.children[i]->expression_class !=
-            ExpressionClass::BOUND_CONSTANT) {
+        if (!op.children[i] || op.children[i]->expression_class !=
+                                   ExpressionClass::BOUND_CONSTANT) {
           return false;
         }
         auto &c = op.children[i]->Cast<BoundConstantExpression>();
@@ -1034,6 +1054,9 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   }
   case ExpressionClass::BOUND_BETWEEN: {
     auto &between = expr.Cast<BoundBetweenExpression>();
+    if (!between.input || !between.lower || !between.upper) {
+      return false;
+    }
     uint8_t lower_op = 0;
     uint8_t upper_op = 0;
     if (!TryEncodeLanceFilterIRComparisonOp(between.LowerComparisonType(),
@@ -1043,11 +1066,11 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     string input_ir, lower_ir, upper_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+    if (!TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                    *between.input, input_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+        !TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                    *between.lower, lower_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+        !TryBuildLanceExprFilterIR(get, names, types, computed_columns,
                                    *between.upper, upper_ir)) {
       return false;
     }

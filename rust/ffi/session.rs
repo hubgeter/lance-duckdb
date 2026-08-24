@@ -43,6 +43,7 @@ pub(crate) fn record_commit() {
     COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_session(
     index_cache_size_bytes: u64,
@@ -95,6 +96,7 @@ fn clear_session_caches(handle: &SessionHandle) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_session(session: *mut c_void) {
     if !session.is_null() {
@@ -103,24 +105,25 @@ pub unsafe extern "C" fn lance_close_session(session: *mut c_void) {
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_session_get_stats(
     session: *mut c_void,
     out_stats: *mut LanceSessionStats,
 ) -> i32 {
-    if !out_stats.is_null() {
-        unsafe {
-            std::ptr::write_unaligned(out_stats, LanceSessionStats::default());
-        }
+    if out_stats.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_stats is null");
+        return -1;
+    }
+    unsafe {
+        std::ptr::write_unaligned(out_stats, LanceSessionStats::default());
     }
 
     match session_get_stats_inner(session) {
         Ok(stats) => {
             clear_last_error();
-            if !out_stats.is_null() {
-                unsafe {
-                    std::ptr::write_unaligned(out_stats, stats);
-                }
+            unsafe {
+                std::ptr::write_unaligned(out_stats, stats);
             }
             0
         }
@@ -141,6 +144,7 @@ fn session_get_stats_inner(session: *mut c_void) -> FfiResult<LanceSessionStats>
     })
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_debug_get_counters(out_counters: *mut LanceDebugCounters) -> i32 {
     if out_counters.is_null() {
@@ -160,6 +164,7 @@ pub unsafe extern "C" fn lance_debug_get_counters(out_counters: *mut LanceDebugC
     0
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_debug_reset_counters() {
     DATASET_OPEN_COUNT.store(0, Ordering::Relaxed);
@@ -189,6 +194,11 @@ mod tests {
         unsafe {
             let session = lance_create_session(0, 0);
             assert!(!session.is_null());
+            assert_eq!(lance_session_get_stats(session, std::ptr::null_mut()), -1);
+            assert_eq!(
+                crate::error::lance_last_error_code(),
+                ErrorCode::InvalidArgument as i32
+            );
 
             let mut stats = LanceSessionStats::default();
             assert_eq!(lance_session_get_stats(session, &mut stats), 0);

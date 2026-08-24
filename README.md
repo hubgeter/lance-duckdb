@@ -1,45 +1,88 @@
-# Lance DuckDB Extension
+# Lance for DuckDB and Vane
 
-[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
+[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This repository contains the Lance extension source maintained for both [DuckDB](https://duckdb.org/) and [Vane](https://github.com/hubgeter/vane).
 
-## Install
+> [!IMPORTANT]
+> DuckDB and Vane use different C++ ABIs. Build the source separately against
+> the matching DuckDB tree and never load an artifact from one environment into
+> the other. Both products are independently shipped loadable extensions;
+> neither artifact is bundled into Vane.
 
-### Install from DuckDB (recommended)
+## Build modes
 
-If you just want to use the extension, install it directly from DuckDB's core extensions repository:
+The same source tree has two explicit entry points:
 
-```sql
-INSTALL lance;
-LOAD lance;
+- `extension_config.cmake` builds the normal DuckDB extension with
+  `LANCE_VANE_DISTRIBUTED=OFF` and produces the static and loadable targets.
+- `extension_config_vane.cmake` enables
+  `LANCE_VANE_DISTRIBUTED=ON` for Vane's fork and produces a Vane-compatible
+  loadable target. The static target is linked only into DuckDB's native unit
+  test executable; it is not a Vane deliverable.
 
-SELECT *
-  FROM 'path/to/dataset.lance'
-  LIMIT 1;
-```
+The distributed scan/write callbacks are selected at compile time. The common
+Lance scan, search, write, and Rust FFI code remains shared, so the official
+DuckDB path does not include Vane-only headers or callbacks.
 
-See DuckDB's extension page for `lance` for the latest release details: https://duckdb.org/docs/stable/core_extensions/lance
+## Build and test with official DuckDB
 
-### Build from source (development)
-
-This repository focuses on source builds for development and CI.
-
-1. Initialize submodules:
+Initialize the pinned DuckDB and extension CI submodules, then use the normal
+DuckDB extension targets:
 
 ```bash
 git submodule update --init --recursive
+GEN=ninja make release -j 4
+./build/release/test/unittest "test/*"
 ```
 
-2. Build:
+## Build and test against Vane
+
+The repository includes the pinned Vane extension CI tools. They check out the
+exact Vane revision declared by `vane-extension.toml`, build the extension
+against `external/duckdb`, run its native contract smoke test, and leave the
+loadable artifact under `build/vane-native/extension/lance/`:
 
 ```bash
-GEN=ninja make release
+export VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+make vane_ci
 ```
 
-3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
+Install this repository's Python package without an editable install. To test a
+development artifact, opt into unsigned extensions only on the coordinator and
+provide the artifact explicitly:
 
 ```bash
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
+python -m pip install . pytest
+export LANCE_DUCKDB_EXTENSION="$PWD/build/vane-native/extension/lance/lance.duckdb_extension"
+export LANCE_DUCKDB_TEST_ALLOW_UNSIGNED=1
+pytest python/tests/test_vane.py
 ```
+
+The unsigned development setting skips Ray cases because distributed workers
+intentionally reject unsigned code. The production signed-artifact lane runs
+the same module without `LANCE_DUCKDB_TEST_ALLOW_UNSIGNED` and includes Ray.
+
+Production Ray deployments must use a signed artifact pre-provisioned at the
+same absolute path on every node. Vane never downloads, installs, or copies the
+artifact while replaying a distributed plan. See
+[`docs/vane-integration.md`](./docs/vane-integration.md) for the ownership,
+loading, distributed execution, lease, CI, and compatibility contracts.
+
+## Load the matching artifact
+
+The optional Python helper package does not contain a native binary and never
+downloads one. It loads only an explicit path or `LANCE_DUCKDB_EXTENSION`:
+
+```python
+import duckdb
+from lance_duckdb import load_lance_extension
+
+connection = duckdb.connect()
+load_lance_extension(connection, "/opt/duckdb/extensions/lance.duckdb_extension")
+```
+
+Use the same helper with `vane.connect()` and the separately built Vane ABI
+artifact. Development-only unsigned artifacts require the host's explicit
+`allow_unsigned_extensions` setting; do not use that setting in production.
 
 ## Usage
 
@@ -97,7 +140,7 @@ COPY (
 COPY (
   SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
   LIMIT 0
-) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
+) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite');
 ```
 
 To write to `s3://...` paths, configure a `TYPE LANCE` secret for that scope (see [`docs/cloud.md`](./docs/cloud.md)).

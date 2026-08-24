@@ -1,0 +1,169 @@
+name: Vane loadable extension
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install package non-editably
+        run: python -m pip install . "pytest>=8"
+
+      - name: Run host-independent Python tests
+        run: pytest python/tests/test_identity.py python/tests/test_loading.py
+
+  vane-native:
+    name: Vane ABI loadable artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}
+      VANE_MANIFEST: ${{ github.workspace }}/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/build/vane-source
+      VANE_NATIVE_BUILD_DIR: ${{ github.workspace }}/build/vane-native
+      VANE_BUILD_JOBS: 12
+      VCPKG_TARGET_TRIPLET: x64-linux
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-native-ccache
+      CCACHE_MAXSIZE: 750M
+      CCACHE_COMPILERCHECK: content
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+    steps:
+      - name: Checkout extension and CI tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            ccache \
+            flex \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            libtool \
+            pkg-config \
+            protobuf-compiler \
+            tar \
+            unzip \
+            zip
+          python -m pip install \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0" \
+            "pytest>=8"
+
+      - name: Restore compiler cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: vane-loadable-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vane-extension.toml') }}
+
+      - name: Restore Vane dependency cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vane-loadable-vcpkg-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vcpkg.json', 'vane-extension.toml') }}
+
+      - name: Read vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          baseline="$(python -c 'import json; print(json.load(open("vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Build and test against the pinned Vane ABI
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          make vane_ci \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_NATIVE_BUILD_DIR="$VANE_NATIVE_BUILD_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS"
+
+      - name: Install the exact Vane host and plugin package
+        env:
+          CMAKE_PREFIX_PATH: ${{ env.VANE_SOURCE_DIR }}/vcpkg_installed/x64-linux
+          SKBUILD_BUILD_DIR: ${{ env.VANE_SOURCE_DIR }}/build/python-release
+          SKBUILD_CMAKE_BUILD_TYPE: Release
+          VCPKG_INSTALLED_DIR: ${{ env.VANE_SOURCE_DIR }}/vcpkg_installed
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          bash "$VANE_SOURCE_DIR/scripts/bootstrap_vcpkg.sh" "$VANE_SOURCE_DIR"
+          python -m pip install "$VANE_SOURCE_DIR" --no-build-isolation
+          python -m pip install . --no-build-isolation --no-deps
+
+      - name: Run plugin-owned Vane integration tests
+        env:
+          LANCE_DUCKDB_EXTENSION: ${{ env.VANE_NATIVE_BUILD_DIR }}/extension/lance/lance.duckdb_extension
+          LANCE_DUCKDB_TEST_ALLOW_UNSIGNED: "1"
+          PYTHONSAFEPATH: "1"
+        run: |
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH python -m pytest \
+            -c "$GITHUB_WORKSPACE/pyproject.toml" \
+            --rootdir="$GITHUB_WORKSPACE" \
+            "$GITHUB_WORKSPACE/python/tests/test_vane.py"
+
+      - name: Stage independent loadable artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="$VANE_NATIVE_BUILD_DIR/extension/lance/lance.duckdb_extension"
+          test -f "$artifact"
+          mkdir -p build/vane-artifact
+          cp "$artifact" build/vane-artifact/lance.duckdb_extension
+          sha256sum build/vane-artifact/lance.duckdb_extension
+
+      - name: Upload Vane ABI extension
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lance-vane-loadable-${{ github.sha }}
+          path: build/vane-artifact/lance.duckdb_extension
+          if-no-files-found: error

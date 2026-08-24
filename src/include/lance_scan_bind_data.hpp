@@ -25,6 +25,30 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowTableSchema scan_arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  uint64_t dataset_version = 0;
+  string dataset_generation_id;
+  bool non_replayable_storage_options = false;
+
+  //! A target scan nested inside UPDATE/DELETE/MERGE is protected by the
+  //! enclosing mutation lease.  Acquiring a second, conflicting snapshot
+  //! lease for that same write would self-deadlock before the sink can obtain
+  //! its mutation lease.
+  bool mutation_scan = false;
+
+  //! Process-independent distributed scan state. A split contains only a
+  //! fragment id; URI, version, projections and filters live in serialized
+  //! bind data. Search/query-table paths use one explicit global split.
+  bool scan_splits_applied = false;
+  bool force_global_scan = false;
+  vector<uint64_t> selected_fragment_ids;
+
+  //! Namespace identity is retained without resolved credentials. Workers use
+  //! replayed connection settings where the extension supports them.
+  bool reopen_via_namespace = false;
+  bool namespace_requires_worker_auth = false;
+  string namespace_endpoint;
+  string namespace_table_id;
+  string namespace_delimiter;
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
   optional_ptr<TableCatalogEntry> table_entry = nullptr;
@@ -41,6 +65,8 @@ struct LanceScanBindData : public TableFunctionData {
   idx_t pushed_offset = 0;
 
   bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
+
+  unique_ptr<FunctionData> Copy() const override;
 
   ~LanceScanBindData() override;
 };

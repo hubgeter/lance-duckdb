@@ -10,6 +10,7 @@ use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::projection;
+use super::query_table::NamespaceQueryStream;
 
 pub(crate) type SchemaHandle = Arc<Schema>;
 
@@ -46,6 +47,7 @@ pub(crate) enum StreamHandle {
     Take(LanceTakeStream),
     DataFusion(DataFusionStream),
     Batches(std::vec::IntoIter<RecordBatch>),
+    Namespace(Box<NamespaceQueryStream>),
 }
 
 impl StreamHandle {
@@ -55,6 +57,9 @@ impl StreamHandle {
             StreamHandle::Take(stream) => stream.next().map_err(anyhow::Error::new),
             StreamHandle::DataFusion(stream) => stream.next().map_err(anyhow::Error::new),
             StreamHandle::Batches(iter) => Ok(iter.next()),
+            StreamHandle::Namespace(stream) => stream
+                .next_batch()
+                .map_err(|err| anyhow::anyhow!(err.message)),
         }
     }
 }

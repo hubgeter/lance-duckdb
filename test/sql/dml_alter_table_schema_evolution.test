@@ -10,6 +10,29 @@ COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/alter_table_schema_evolution_seed.la
 statement ok
 ATTACH 'test/.tmp' AS ns (TYPE LANCE);
 
+# CREATE TABLE defaults are part of the initial Lance schema commit. They must
+# survive rebuilding the attached catalog instead of relying on a later
+# best-effort metadata mutation.
+statement ok
+CREATE OR REPLACE TABLE ns.main.create_default_atomic (
+  id BIGINT,
+  value INTEGER DEFAULT 7
+);
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+INSERT INTO ns.main.create_default_atomic(id) VALUES (1);
+
+query I
+SELECT value FROM ns.main.create_default_atomic WHERE id = 1;
+----
+7
+
 statement ok
 CREATE OR REPLACE TABLE ns.main.alter_table_schema_evolution AS
   SELECT 1::BIGINT AS id, 10::INTEGER AS age, 0.5::DOUBLE AS score
@@ -52,6 +75,25 @@ query I
 SELECT sum(const_col) FROM ns.main.alter_table_schema_evolution
 ----
 126
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution ADD COLUMN "label-v1" VARCHAR DEFAULT 'quoted';
+
+query T
+SELECT min("label-v1") FROM ns.main.alter_table_schema_evolution
+----
+quoted
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution RENAME COLUMN "label-v1" TO "label-v2";
+
+query T
+SELECT min("label-v2") FROM ns.main.alter_table_schema_evolution
+----
+quoted
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution DROP COLUMN "label-v2";
 
 statement ok
 COMMENT ON COLUMN ns.main.alter_table_schema_evolution.age_plus_one IS 'col comment';
@@ -148,6 +190,23 @@ statement error
 SELECT score2 FROM ns.main.alter_table_schema_evolution LIMIT 1;
 ----
 Binder Error:
+
+statement ok
+DETACH ns;
+
+# The default is part of the same Lance schema-evolution commit and must still
+# be available after rebuilding the DuckDB catalog entry.
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+INSERT INTO ns.main.alter_table_schema_evolution(id, age, age_plus_one)
+VALUES (4, 40, 41);
+
+query I
+SELECT const_col FROM ns.main.alter_table_schema_evolution WHERE id = 4;
+----
+42
 
 statement ok
 DETACH ns;

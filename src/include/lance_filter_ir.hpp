@@ -7,6 +7,7 @@ namespace duckdb {
 struct TableFunctionInitInput;
 class LogicalGet;
 class Expression;
+enum class LanceComputedSearchColumns : uint8_t;
 
 bool LanceFilterIRSupportsLogicalType(const LogicalType &type);
 
@@ -19,6 +20,11 @@ struct LanceFilterIRBuildResult {
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const TableFunctionInitInput &input, bool exclude_computed_columns);
+LanceFilterIRBuildResult
+BuildLanceTableFilterIRParts(const vector<string> &names,
+                             const vector<LogicalType> &types,
+                             const TableFunctionInitInput &input,
+                             LanceComputedSearchColumns computed_columns);
 
 // Probe whether every filter attached to `get.table_filters` can be encoded
 // into Lance filter IR. Owns the invariant "filters encodable → limit/offset
@@ -37,6 +43,11 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const vector<string> &names,
                                const vector<LogicalType> &types,
                                bool exclude_computed_columns,
+                               const Expression &expr, string &out_ir);
+bool TryBuildLanceExprFilterIR(const LogicalGet &get,
+                               const vector<string> &names,
+                               const vector<LogicalType> &types,
+                               LanceComputedSearchColumns computed_columns,
                                const Expression &expr, string &out_ir);
 
 bool TryBuildLanceTableFilterIRParts(const vector<string> &names,

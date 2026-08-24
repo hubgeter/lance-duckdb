@@ -1,0 +1,11 @@
+schema_version = 1
+name = "lance"
+extension_config = "extension_config_vane.cmake"
+build_extensions = ["httpfs", "parquet", "json", "icu"]
+# The CI tool accepts one DuckDB test selector.  Keep this lane deterministic;
+# the regular DuckDB workflow runs the complete Lance SQLLogicTest suite.
+native_test_selection = "test/sql/dual_build_smoke.test"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "bdb8f819ac075733e03eaf4ff63071ccf47ea0ab"

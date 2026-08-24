@@ -1,19 +1,14 @@
 # SQL Reference
 
-This document lists the SQL surface currently supported by the `lance` DuckDB extension, with short examples.
+This document lists the SQL surface supported by the loadable `lance`
+extension in official DuckDB and Vane, with short examples.
 
-## Loading
+## Availability
 
-```sql
-INSTALL lance FROM community;
-LOAD lance;
-```
-
-For local development builds, load the extension artifact directly:
-
-```sql
-LOAD 'build/release/extension/lance/lance.duckdb_extension';
-```
+Load an artifact compiled for the host's exact DuckDB ABI before using this SQL
+surface. Official-DuckDB and Vane artifacts are not interchangeable. The
+artifact is distributed by this repository and is not compiled into
+`vane._native`.
 
 ## Scan
 
@@ -24,6 +19,23 @@ SELECT *
 FROM 'path/to/dataset.lance'
 LIMIT 10;
 ```
+
+Local relative dataset paths are resolved against the process working
+directory when the dataset is bound. Lance paths do not use DuckDB's
+`file_search_path`; use an absolute path when the working directory may change
+or when workers must agree on a shared filesystem identity.
+
+Lance scans support DuckDB `TABLESAMPLE SYSTEM (... PERCENT)` pushdown. The
+extension selects exactly `floor(row_count * percentage / 100)` row IDs without
+replacement. `REPEATABLE (seed)` uses the supplied seed and returns the same
+row IDs for the same fixed dataset version. `EXPLAIN` reports the percentage,
+seed, and repeatable flag.
+
+Where a search function accepts either a dataset URI or an attached table,
+`.lance`-suffixed values are treated as paths by default. Use `path:<uri>` to
+force path resolution or `table:<catalog.schema.table>` to force catalog
+resolution. Quoted catalog identifiers remain supported for names containing
+dots.
 
 ## Search
 
@@ -172,7 +184,10 @@ DETACH ns;
 Scans of REST namespace tables use the Lance Namespace `query_table` API.
 Projection, supported filters, and `LIMIT`/`OFFSET` pairs are pushed into the
 request; unsupported filters and standalone `OFFSET` operations remain in
-DuckDB. Directory namespace scans continue to read the Lance dataset directly.
+DuckDB. The bind resolves a concrete table version, and every paginated
+request carries that version. IPC file and stream responses are validated by
+field name, type, and order before they reach DuckDB. Directory namespace
+scans continue to read the Lance dataset directly.
 
 ## Write datasets
 
@@ -301,8 +316,18 @@ DETACH ns;
 ```
 
 Notes:
-- Mutating the same target row more than once in a single `MERGE` raises a constraint error.
+- A target row is mutated and emitted by `RETURNING` at most once. If multiple
+  source rows match the same target row, only the first mutating match seen by
+  the execution plan is applied; deduplicate the source when the chosen value
+  must be deterministic.
 - `MERGE` uses a single Lance transaction per statement.
+- An explicit DuckDB transaction may contain at most one Lance mutation. That
+  mutation is kept uncommitted until `COMMIT` and its orphan files are removed
+  by `ROLLBACK`; the optional `lance_duckdb` distributed Python facade requires
+  autocommit.
+- Lance cannot atomically coordinate that external commit with mutations in a
+  different attached catalog, so do not use an explicit transaction to imply a
+  cross-catalog atomic commit.
 
 ### `TRUNCATE TABLE`
 
@@ -391,6 +416,8 @@ USING INVERTED;
 
 Notes:
 - `CREATE INDEX` currently supports a single column.
+- `CREATE INDEX` and `DROP INDEX` reject explicit transactions because the
+  external index commit cannot be rolled back with DuckDB's transaction.
 - Vector indices require a fixed-size vector column. If a dataset was written with
   `FLOAT[]` / `DOUBLE[]`, first cast it with `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT[N]`
   (or `DOUBLE[N]`) and then create the index.
@@ -425,6 +452,11 @@ Supported `mode` values:
 Maintenance statements accept either:
 - A dataset path string literal (for example `'path/to/dataset.lance'`)
 - An attached Lance table name (for example `ns.main.my_table`)
+
+The parser preserves that choice by passing an explicit path/table resolution
+mode to the internal function. Quoted qualified names such as
+`"team.data-x"."main"."items.v1"` are supported and are never reinterpreted as
+filesystem paths.
 
 ### `OPTIMIZE`
 

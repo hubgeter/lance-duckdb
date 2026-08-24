@@ -1,0 +1,115 @@
+# name: test/sql/metadata_roundtrip.test
+# description: Metadata round trips preserve delimiter characters and reject C ABI truncation
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO 'test/.tmp/metadata_roundtrip.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+SELECT * FROM lance_set_table_metadata(
+  'test/.tmp/metadata_roundtrip.lance',
+  'key' || chr(9) || 'tab',
+  'value' || chr(10) || 'line'
+);
+
+query TT
+SELECT hex(Key), hex(Value)
+FROM lance_table_metadata('test/.tmp/metadata_roundtrip.lance')
+WHERE Key = 'key' || chr(9) || 'tab';
+----
+6B657909746162	76616C75650A6C696E65
+
+statement ok
+SELECT * FROM lance_set_schema_metadata(
+  'test/.tmp/metadata_roundtrip.lance',
+  'snow',
+  '雪' || chr(9) || chr(10)
+);
+
+query TT
+SELECT hex(Key), hex(Value)
+FROM lance_schema_metadata('test/.tmp/metadata_roundtrip.lance')
+WHERE Key = 'snow';
+----
+736E6F77	E99BAA090A
+
+statement ok
+SELECT * FROM lance_set_column_metadata(
+  'test/.tmp/metadata_roundtrip.lance',
+  'id',
+  'field' || chr(10) || 'key',
+  'field' || chr(9) || 'value'
+);
+
+query TT
+SELECT hex(Key), hex(Value)
+FROM lance_column_metadata('test/.tmp/metadata_roundtrip.lance', 'id')
+WHERE Key = 'field' || chr(10) || 'key';
+----
+6669656C640A6B6579	6669656C640976616C7565
+
+# Metadata helpers support attached table identities as well as direct paths.
+statement ok
+ATTACH 'test/.tmp' AS metadata_ns (TYPE LANCE);
+
+statement ok
+SELECT * FROM lance_set_table_metadata(
+  'metadata_ns.main.metadata_roundtrip',
+  'attached',
+  'works'
+);
+
+query TT
+SELECT Key, Value
+FROM lance_table_metadata('metadata_ns.main.metadata_roundtrip')
+WHERE Key = 'attached';
+----
+attached	works
+
+# Metadata commits are immediate and must not pretend to roll back with an
+# explicit DuckDB transaction.
+statement ok
+BEGIN;
+
+statement error
+SELECT * FROM lance_set_table_metadata(
+  'metadata_ns.main.metadata_roundtrip',
+  'must_not_commit',
+  'value'
+);
+----
+Not implemented Error: Lance metadata mutation does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*)
+FROM lance_table_metadata('metadata_ns.main.metadata_roundtrip')
+WHERE Key = 'must_not_commit';
+----
+0
+
+statement ok
+DETACH metadata_ns;
+
+statement error
+SELECT * FROM lance_set_table_metadata(
+  'test/.tmp/metadata_roundtrip.lance',
+  'bad' || chr(0) || 'key',
+  'value'
+);
+----
+Invalid Input Error: Lance metadata key must not contain a NUL byte
+
+statement error
+SELECT * FROM lance_set_table_metadata(
+  'test/.tmp/metadata_roundtrip.lance',
+  'key',
+  'bad' || chr(0) || 'value'
+);
+----
+Invalid Input Error: Lance metadata value must not contain a NUL byte

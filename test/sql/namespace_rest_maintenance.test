@@ -12,9 +12,9 @@ test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
 test-env LANCE_NAMESPACE_MAINT_ID default_maint
 
 # Use a single-segment table name (no dots) because the lance-namespace REST
-# API treats '.' as its own namespace/table separator.  The maintenance parser
-# extension itself does accept dotted bare identifiers (e.g.
-# `OPTIMIZE cat.sch.tbl`); it just does not accept quoted identifiers.
+# API treats '.' as its own namespace/table separator. The maintenance parser
+# accepts both dotted bare identifiers and quoted qualified identifiers; this
+# fixture keeps the remote table ID itself single-segment.
 test-env LANCE_NAMESPACE_MAINT_TABLE maint_table
 
 require lance

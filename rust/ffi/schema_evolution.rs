@@ -7,8 +7,9 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use arrow::compute;
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Schema as ArrowSchema};
-use chrono::{Duration, Utc};
+use arrow_schema::Schema as ArrowSchema;
+use chrono::{DateTime, Duration, Utc};
+use futures::TryStreamExt;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
@@ -19,8 +20,8 @@ use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
 
 use super::util::{
-    canonicalize_lance_field_path, cstr_to_str, optional_cstr_array, to_c_string, FfiError,
-    FfiResult,
+    canonicalize_lance_field_path, cstr_to_str, lance_mutation_error, optional_cstr_array,
+    to_c_string, FfiError, FfiResult,
 };
 
 fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
@@ -59,6 +60,56 @@ struct CleanupOldVersionsMetricsOutput {
     old_versions: u64,
 }
 
+pub(super) async fn cleanup_vane_staging_files(
+    dataset: &Dataset,
+    cutoff: DateTime<Utc>,
+) -> Result<(), lance::Error> {
+    // Durable operation markers are the source of truth for idempotent replay
+    // after Lance has vacuumed the transaction that originally recorded the
+    // operation.  VACUUM must therefore only remove abandoned staging files.
+    // Match Lance's safety window for those unverified files so a cleanup
+    // running without the caller's coordination cannot erase an active write.
+    // An explicitly unsafe cleanup may use the requested threshold directly.
+    let store = dataset.object_store(None).await?;
+    let base = dataset.branch_location().path;
+
+    let prefix = if base.as_ref().is_empty() {
+        object_store::path::Path::parse("_vane_staging")?
+    } else {
+        object_store::path::Path::parse(format!("{}/_vane_staging", base.as_ref()))?
+    };
+    let objects = match store.list(Some(prefix)).try_collect::<Vec<_>>().await {
+        Ok(objects) => objects,
+        Err(error) if error.is_not_found() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for object in objects {
+        if object.last_modified < cutoff {
+            store.delete(&object.location).await?;
+        }
+    }
+    Ok(())
+}
+
+fn checked_cleanup_cutoff(
+    now: DateTime<Utc>,
+    older_than_seconds: i64,
+    label: &str,
+) -> FfiResult<DateTime<Utc>> {
+    let retention = Duration::try_seconds(older_than_seconds).ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{label} is too large to represent"),
+        )
+    })?;
+    now.checked_sub_signed(retention).ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{label} produces a timestamp outside the supported range"),
+        )
+    })
+}
+
 impl Default for CleanupOldVersionsOptionsInput {
     fn default() -> Self {
         Self {
@@ -87,6 +138,30 @@ fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<Compa
             format!("compact_files options_json parse: {err}"),
         )
     })?;
+
+    for (name, value) in [
+        ("target_rows_per_fragment", input.target_rows_per_fragment),
+        ("max_rows_per_group", input.max_rows_per_group),
+        ("max_bytes_per_file", input.max_bytes_per_file),
+        ("num_threads", input.num_threads),
+        ("batch_size", input.batch_size),
+    ] {
+        if value == Some(0) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("compact_files option '{name}' must be greater than zero"),
+            ));
+        }
+    }
+    if input
+        .materialize_deletions_threshold
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "compact_files option 'materialize_deletions_threshold' must be finite and non-negative",
+        ));
+    }
 
     let mut options = CompactionOptions::default();
     if let Some(v) = input.target_rows_per_fragment {
@@ -166,18 +241,63 @@ fn parse_arrow_schema(schema: *const c_void, what: &'static str) -> FfiResult<Ar
     }
 
     let ffi_schema = unsafe { &*(schema as *const arrow_schema::ffi::FFI_ArrowSchema) };
-    let data_type = DataType::try_from(ffi_schema).map_err(|err| {
+    let schema = ArrowSchema::try_from(ffi_schema).map_err(|err| {
         FfiError::new(ErrorCode::InvalidArgument, format!("{what} import: {err}"))
     })?;
-    let DataType::Struct(fields) = data_type else {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            format!("{what} must be a struct"),
-        ));
-    };
-    Ok(Arc::new(ArrowSchema::new(fields)))
+    Ok(Arc::new(schema))
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use arrow_schema::ffi::FFI_ArrowSchema;
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+
+    #[test]
+    fn rejects_unrepresentable_cleanup_interval() {
+        let error = checked_cleanup_cutoff(Utc::now(), i64::MAX, "older_than_seconds")
+            .expect_err("an i64::MAX-second chrono duration is not representable");
+        assert_eq!(error.code as i32, ErrorCode::InvalidArgument as i32);
+        assert!(error.message.contains("too large"));
+    }
+
+    #[test]
+    fn arrow_schema_import_preserves_schema_metadata() {
+        let expected = ArrowSchema::new_with_metadata(
+            vec![Field::new("value", DataType::Int64, false)],
+            HashMap::from([("owner".to_string(), "vane".to_string())]),
+        );
+        let ffi = FFI_ArrowSchema::try_from(&expected).unwrap();
+        let actual = parse_arrow_schema(
+            &ffi as *const FFI_ArrowSchema as *const c_void,
+            "test_schema",
+        )
+        .unwrap();
+        assert_eq!(actual.as_ref(), &expected);
+    }
+
+    #[test]
+    fn rejects_unsafe_zero_compaction_options() {
+        for options in [
+            r#"{"target_rows_per_fragment":0}"#,
+            r#"{"max_rows_per_group":0}"#,
+            r#"{"max_bytes_per_file":0}"#,
+            r#"{"num_threads":0}"#,
+            r#"{"batch_size":0}"#,
+            r#"{"materialize_deletions_threshold":-0.1}"#,
+        ] {
+            let options = std::ffi::CString::new(options).unwrap();
+            let error = parse_compaction_options_json(options.as_ptr())
+                .expect_err("unsafe compaction option must fail at the FFI boundary");
+            assert_eq!(error.code as i32, ErrorCode::InvalidArgument as i32);
+        }
+    }
+}
+
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_add_columns(
     dataset: *mut c_void,
@@ -232,9 +352,11 @@ fn dataset_add_columns_inner(
         let transforms = NewColumnTransform::AllNulls(output_schema);
         match runtime::block_on(ds.add_columns(transforms, None, batch_size)) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(FfiError::new(
+            Ok(Err(err)) => Err(lance_mutation_error(
                 ErrorCode::DatasetAddColumns,
-                format!("dataset add_columns(all_nulls): {err}"),
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                "dataset add_columns(all_nulls)",
+                err,
             )),
             Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
@@ -299,6 +421,24 @@ fn dataset_add_columns_inner(
             })
             .collect::<FfiResult<Vec<_>>>()?;
 
+        // This FFI is used by DuckDB ALTER TABLE ADD COLUMN, where every SQL
+        // expression is also the persisted default expression.  Put that
+        // metadata into the new field before the single add-columns commit;
+        // a follow-up metadata commit would make ADD COLUMN partially atomic.
+        let output_schema = Arc::new(ArrowSchema::new_with_metadata(
+            output_schema
+                .fields()
+                .iter()
+                .zip(exprs.iter())
+                .map(|(field, expression)| {
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert("duckdb_default_expr".to_string(), expression.clone());
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                })
+                .collect::<Vec<_>>(),
+            output_schema.metadata().clone(),
+        ));
+
         let output_fields = output_schema.fields().to_vec();
         let schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
@@ -342,15 +482,18 @@ fn dataset_add_columns_inner(
         );
         match runtime::block_on(ds.add_columns(transforms, read_columns, batch_size)) {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(FfiError::new(
+            Ok(Err(err)) => Err(lance_mutation_error(
                 ErrorCode::DatasetAddColumns,
-                format!("dataset add_columns(sql): {err}"),
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                "dataset add_columns(sql)",
+                err,
             )),
             Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_drop_columns(
     dataset: *mut c_void,
@@ -387,14 +530,17 @@ fn dataset_drop_columns_inner(
     let col_refs = cols.iter().map(|c| c.as_str()).collect::<Vec<_>>();
     match runtime::block_on(ds.drop_columns(&col_refs)) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetDropColumns,
-            format!("dataset drop_columns: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset drop_columns",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_alter_columns_rename(
     dataset: *mut c_void,
@@ -426,14 +572,17 @@ fn dataset_alter_columns_rename_inner(
     let alteration = ColumnAlteration::new(path).rename(new_name);
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetAlterColumns,
-            format!("dataset alter_columns(rename): {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset alter_columns(rename)",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_alter_columns_set_nullable(
     dataset: *mut c_void,
@@ -464,14 +613,17 @@ fn dataset_alter_columns_set_nullable_inner(
     let alteration = ColumnAlteration::new(path).set_nullable(nullable);
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetAlterColumns,
-            format!("dataset alter_columns(nullable): {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset alter_columns(nullable)",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_alter_columns_cast(
     dataset: *mut c_void,
@@ -511,14 +663,17 @@ fn dataset_alter_columns_cast_inner(
     let alteration = ColumnAlteration::new(path).cast_to(new_type);
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetAlterColumns,
-            format!("dataset alter_columns(cast): {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset alter_columns(cast)",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_table_metadata(
     dataset: *mut c_void,
@@ -544,6 +699,12 @@ fn dataset_update_table_metadata_inner(
 ) -> FfiResult<()> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let key = unsafe { cstr_to_str(key, "key")? }.to_string();
+    if key.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "metadata key must be non-empty",
+        ));
+    }
     let value = if value.is_null() {
         None
     } else {
@@ -558,14 +719,17 @@ fn dataset_update_table_metadata_inner(
     let updates = [(key.as_str(), value)];
     match runtime::block_on(async { ds.update_metadata(updates).await }) {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetUpdateMetadata,
-            format!("dataset update_metadata: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset update_metadata",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_config(
     dataset: *mut c_void,
@@ -589,30 +753,109 @@ fn dataset_update_config_inner(
     key: *const c_char,
     value: *const c_char,
 ) -> FfiResult<()> {
-    let handle = unsafe { super::util::dataset_handle(dataset)? };
     let key = unsafe { cstr_to_str(key, "key")? }.to_string();
+    if key.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "config key must be non-empty",
+        ));
+    }
     let value = if value.is_null() {
         None
     } else {
-        Some(
-            unsafe { CStr::from_ptr(value) }
-                .to_str()
-                .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}")))?,
-        )
+        Some(unsafe { cstr_to_str(value, "value")? }.to_string())
     };
 
+    dataset_update_config_entries_inner(dataset, vec![(key, value)])
+}
+
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_update_config_entries(
+    dataset: *mut c_void,
+    keys: *const *const c_char,
+    values: *const *const c_char,
+    entries_len: usize,
+) -> i32 {
+    match dataset_update_config_entries_from_ffi(dataset, keys, values, entries_len) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn dataset_update_config_entries_from_ffi(
+    dataset: *mut c_void,
+    keys: *const *const c_char,
+    values: *const *const c_char,
+    entries_len: usize,
+) -> FfiResult<()> {
+    if entries_len == 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "config entries must be non-empty",
+        ));
+    }
+    let keys = unsafe { super::util::slice_from_ptr(keys, entries_len, "config keys")? };
+    let values = unsafe { super::util::slice_from_ptr(values, entries_len, "config values")? };
+    let mut seen = HashSet::with_capacity(entries_len);
+    let mut updates = Vec::with_capacity(entries_len);
+    for (index, (&key, &value)) in keys.iter().zip(values.iter()).enumerate() {
+        let key = unsafe { cstr_to_str(key, "config key")? };
+        if key.is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("config key at index {index} is empty"),
+            ));
+        }
+        if !seen.insert(key.to_string()) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("duplicate config key: {key}"),
+            ));
+        }
+        let value = if value.is_null() {
+            None
+        } else {
+            Some(unsafe { cstr_to_str(value, "config value")? }.to_string())
+        };
+        updates.push((key.to_string(), value));
+    }
+    dataset_update_config_entries_inner(dataset, updates)
+}
+
+fn dataset_update_config_entries_inner(
+    dataset: *mut c_void,
+    updates: Vec<(String, Option<String>)>,
+) -> FfiResult<()> {
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
     let mut ds = (*handle.dataset).clone();
-    let updates = [(key.as_str(), value)];
-    match runtime::block_on(async { ds.update_config(updates).await }) {
+    match runtime::block_on(async {
+        ds.update_config(
+            updates
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_deref())),
+        )
+        .await
+    }) {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetUpdateConfig,
-            format!("dataset update_config: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset update_config",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_schema_metadata(
     dataset: *mut c_void,
@@ -638,6 +881,12 @@ fn dataset_update_schema_metadata_inner(
 ) -> FfiResult<()> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let key = unsafe { cstr_to_str(key, "key")? }.to_string();
+    if key.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "schema metadata key must be non-empty",
+        ));
+    }
     let value = if value.is_null() {
         None
     } else {
@@ -652,14 +901,17 @@ fn dataset_update_schema_metadata_inner(
     let updates = [(key.as_str(), value)];
     match runtime::block_on(async { ds.update_schema_metadata(updates).await }) {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetUpdateSchemaMetadata,
-            format!("dataset update_schema_metadata: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset update_schema_metadata",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_update_field_metadata(
     dataset: *mut c_void,
@@ -688,6 +940,12 @@ fn dataset_update_field_metadata_inner(
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let field_path = unsafe { cstr_to_str(field_path, "field_path")? }.to_string();
     let key = unsafe { cstr_to_str(key, "key")? }.to_string();
+    if field_path.is_empty() || key.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "field path and metadata key must be non-empty",
+        ));
+    }
     let value = if value.is_null() {
         None
     } else {
@@ -711,14 +969,17 @@ fn dataset_update_field_metadata_inner(
 
     match runtime::block_on(async { builder.await }) {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetUpdateFieldMetadata,
-            format!("dataset update_field_metadata: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset update_field_metadata",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_compact_files(dataset: *mut c_void) -> i32 {
     match dataset_compact_files_with_options_inner(dataset, ptr::null(), ptr::null_mut()) {
@@ -733,6 +994,7 @@ pub unsafe extern "C" fn lance_dataset_compact_files(dataset: *mut c_void) -> i3
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_compact_files_with_options(
     dataset: *mut c_void,
@@ -770,16 +1032,19 @@ fn dataset_compact_files_with_options_inner(
             &metrics,
             out_metrics_json,
             "compact_files metrics_json",
-            ErrorCode::DatasetCompactFiles,
+            ErrorCode::DatasetCommitOutcomeUnknown,
         ),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetCompactFiles,
-            format!("dataset compact_files: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset compact_files",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     dataset: *mut c_void,
@@ -803,6 +1068,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
     dataset: *mut c_void,
@@ -846,10 +1112,22 @@ fn dataset_cleanup_old_versions_with_options_struct(
         ));
     }
 
+    const UNVERIFIED_GRACE_SECONDS: i64 = 7 * 24 * 60 * 60;
+    let now = Utc::now();
+    let before_timestamp =
+        checked_cleanup_cutoff(now, options.older_than_seconds, "older_than_seconds")?;
+    let staging_retention_seconds = if options.delete_unverified {
+        options.older_than_seconds
+    } else {
+        options.older_than_seconds.max(UNVERIFIED_GRACE_SECONDS)
+    };
+    let staging_cutoff =
+        checked_cleanup_cutoff(now, staging_retention_seconds, "staging retention interval")?;
+
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ds = (*handle.dataset).clone();
     let mut builder = CleanupPolicyBuilder::default()
-        .before_timestamp(Utc::now() - Duration::seconds(options.older_than_seconds))
+        .before_timestamp(before_timestamp)
         .delete_unverified(options.delete_unverified)
         .error_if_tagged_old_versions(options.error_if_tagged_old_versions);
 
@@ -873,7 +1151,11 @@ fn dataset_cleanup_old_versions_with_options_struct(
     }
 
     let policy = builder.build();
-    match runtime::block_on(ds.cleanup_with_policy(policy)) {
+    match runtime::block_on(async {
+        let stats = ds.cleanup_with_policy(policy).await?;
+        cleanup_vane_staging_files(&ds, staging_cutoff).await?;
+        Ok::<_, lance::Error>(stats)
+    }) {
         Ok(Ok(stats)) => {
             let metrics = CleanupOldVersionsMetricsOutput {
                 bytes_removed: stats.bytes_removed,
@@ -883,17 +1165,22 @@ fn dataset_cleanup_old_versions_with_options_struct(
                 &metrics,
                 out_metrics_json,
                 "cleanup_old_versions metrics_json",
-                ErrorCode::DatasetCleanupOldVersions,
+                ErrorCode::DatasetCommitOutcomeUnknown,
             )
         }
+        // Cleanup is deliberately non-transactional: an error can arrive after
+        // some old manifests, data files, or Vane staging files were removed.
+        // Never describe that state as a definitive no-op, regardless of the
+        // concrete Lance error variant.
         Ok(Err(err)) => Err(FfiError::new(
-            ErrorCode::DatasetCleanupOldVersions,
-            format!("dataset cleanup_old_versions: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            format!("dataset cleanup_old_versions may be incomplete: {err}"),
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_config(dataset: *mut c_void) -> *const c_char {
     match dataset_list_kv_inner(dataset, "config") {
@@ -908,6 +1195,7 @@ pub unsafe extern "C" fn lance_dataset_list_config(dataset: *mut c_void) -> *con
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_table_metadata(dataset: *mut c_void) -> *const c_char {
     match dataset_list_kv_inner(dataset, "metadata") {
@@ -922,6 +1210,7 @@ pub unsafe extern "C" fn lance_dataset_list_table_metadata(dataset: *mut c_void)
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_schema_metadata(dataset: *mut c_void) -> *const c_char {
     match dataset_list_kv_inner(dataset, "schema_metadata") {
@@ -936,6 +1225,7 @@ pub unsafe extern "C" fn lance_dataset_list_schema_metadata(dataset: *mut c_void
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_field_metadata(
     dataset: *mut c_void,
@@ -969,10 +1259,7 @@ fn dataset_list_field_metadata_inner(
     })?;
     let mut out = String::new();
     for (k, v) in field.metadata.iter() {
-        out.push_str(k);
-        out.push('\t');
-        out.push_str(v);
-        out.push('\n');
+        super::util::push_ffi_key_value_row(&mut out, k, v);
     }
     Ok(out)
 }
@@ -985,26 +1272,17 @@ fn dataset_list_kv_inner(dataset: *mut c_void, which: &'static str) -> FfiResult
     match which {
         "config" => {
             for (k, v) in ds.config().iter() {
-                out.push_str(k);
-                out.push('\t');
-                out.push_str(v);
-                out.push('\n');
+                super::util::push_ffi_key_value_row(&mut out, k, v);
             }
         }
         "metadata" => {
             for (k, v) in ds.metadata().iter() {
-                out.push_str(k);
-                out.push('\t');
-                out.push_str(v);
-                out.push('\n');
+                super::util::push_ffi_key_value_row(&mut out, k, v);
             }
         }
         "schema_metadata" => {
             for (k, v) in ds.schema().metadata.iter() {
-                out.push_str(k);
-                out.push('\t');
-                out.push_str(v);
-                out.push('\n');
+                super::util::push_ffi_key_value_row(&mut out, k, v);
             }
         }
         _ => return Err(FfiError::new(ErrorCode::InvalidArgument, "unknown kv type")),
@@ -1013,6 +1291,7 @@ fn dataset_list_kv_inner(dataset: *mut c_void, which: &'static str) -> FfiResult
     Ok(out)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_indices(dataset: *mut c_void) -> *const c_char {
     match dataset_list_indices_inner(dataset) {
@@ -1045,20 +1324,28 @@ fn dataset_list_indices_inner(dataset: *mut c_void) -> FfiResult<String> {
     let schema = ds.schema();
     let mut out = String::new();
     for idx in indices.iter() {
-        out.push_str(&idx.name);
-        out.push('\t');
         let cols = idx
             .fields
             .iter()
-            .filter_map(|id| schema.field_path(*id).ok())
-            .collect::<Vec<_>>()
+            .map(|id| {
+                schema.field_path(*id).map_err(|err| {
+                    FfiError::new(
+                        ErrorCode::DatasetListIndices,
+                        format!(
+                            "index '{}' references invalid field id {id}: {err}",
+                            idx.name
+                        ),
+                    )
+                })
+            })
+            .collect::<FfiResult<Vec<_>>>()?
             .join(",");
-        out.push_str(&cols);
-        out.push('\n');
+        super::util::push_ffi_key_value_row(&mut out, &idx.name, &cols);
     }
     Ok(out)
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_create_scalar_index(
     dataset: *mut c_void,
@@ -1087,6 +1374,12 @@ fn dataset_create_scalar_index_inner(
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let column = unsafe { cstr_to_str(column, "column")? };
     let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
+    if column.is_empty() || index_name.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "index column and name must be non-empty",
+        ));
+    }
 
     let mut ds = (*handle.dataset).clone();
     let canonical_column = canonicalize_lance_field_path(ds.schema(), column, "index column")?;
@@ -1099,9 +1392,11 @@ fn dataset_create_scalar_index_inner(
         replace,
     )) {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetCreateScalarIndex,
-            format!("dataset create_index(scalar): {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset create_index(scalar)",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }

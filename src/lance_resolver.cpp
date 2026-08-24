@@ -4,11 +4,27 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
+#include "lance_common.hpp"
 #include "lance_table_entry.hpp"
 
 #include <algorithm>
 
 namespace duckdb {
+
+static bool HasPrefix(const string &input, const char *prefix) {
+  return input.rfind(prefix, 0) == 0;
+}
+
+static bool LooksLikeDatasetPath(const string &input) {
+  if (input.find('/') != string::npos || input.find('\\') != string::npos ||
+      input.find("://") != string::npos || HasPrefix(input, "./") ||
+      HasPrefix(input, "../") || HasPrefix(input, "~")) {
+    return true;
+  }
+  static constexpr const char *LANCE_SUFFIX = ".lance";
+  return input.size() >= 6 &&
+         StringUtil::CIEquals(input.substr(input.size() - 6), LANCE_SUFFIX);
+}
 
 //===--------------------------------------------------------------------===//
 // DefaultCatalogResolver Implementation
@@ -118,17 +134,39 @@ string LanceDatasetResolverRegistry::Resolve(ClientContext &context,
         function_name + " requires a non-null dataset path or table name");
   }
   auto input_str = input.GetValue<string>();
+  ValidateLanceCString(input_str,
+                       function_name + " dataset path or table name");
   if (input_str.empty()) {
     throw InvalidInputException(
         function_name + " requires a non-empty dataset path or table name");
   }
 
-  // Try each resolver in priority order
+  bool force_path = HasPrefix(input_str, "path:");
+  bool force_table = HasPrefix(input_str, "table:");
+  auto resolver_input = (force_path || force_table)
+                            ? input_str.substr(input_str.find(':') + 1)
+                            : input_str;
+  if (resolver_input.empty()) {
+    throw InvalidInputException(function_name +
+                                " requires a non-empty value after the '" +
+                                (force_path ? "path:" : "table:") + "' prefix");
+  }
+
+  if (force_path || (!force_table && LooksLikeDatasetPath(resolver_input))) {
+    if (policy == LanceResolvePolicy::STRICT) {
+      throw BinderException(
+          function_name + ": a catalog table is required; got dataset path '" +
+          resolver_input + "'");
+    }
+    return resolver_input;
+  }
+
+  // Try each resolver in priority order.
   string last_error;
   {
     lock_guard<mutex> guard(lock_);
     for (const auto &resolver : resolvers_) {
-      auto result = resolver->TryResolve(context, input_str);
+      auto result = resolver->TryResolve(context, resolver_input);
       if (result.success) {
         return result.dataset_uri;
       }
@@ -144,13 +182,20 @@ string LanceDatasetResolverRegistry::Resolve(ClientContext &context,
   case LanceResolvePolicy::STRICT:
     // In STRICT mode, throw an exception with the last error
     if (last_error.empty()) {
-      last_error = "Could not resolve '" + input_str + "' to a Lance dataset";
+      last_error =
+          "Could not resolve '" + resolver_input + "' to a Lance dataset";
     }
     throw BinderException(function_name + ": " + last_error);
 
   case LanceResolvePolicy::FALLBACK_TO_PATH:
-    // In FALLBACK_TO_PATH mode, treat input as direct file path
-    return input_str;
+    if (force_table) {
+      if (last_error.empty()) {
+        last_error = "Could not resolve '" + resolver_input +
+                     "' to a Lance catalog table";
+      }
+      throw BinderException(function_name + ": " + last_error);
+    }
+    return resolver_input;
   }
 
   // Should not reach here

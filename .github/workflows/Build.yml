@@ -40,18 +40,15 @@ jobs:
           echo "sha=${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare cache directories
-        run: |
-          mkdir -p .ccache
+        run: mkdir -p .ccache
 
       - name: Restore ccache
         id: cache-ccache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            .ccache
+          path: .ccache
           key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-
+          restore-keys: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-
 
       - name: Install dependencies
         run: |
@@ -62,8 +59,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: |
-          GEN=ninja make release -j 4
+        run: GEN=ninja make release -j 4
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -72,14 +68,14 @@ jobs:
           path: |
             build/release/test/unittest
             build/release/src/libduckdb.so*
+            build/release/extension/lance/lance.duckdb_extension
           if-no-files-found: error
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
         uses: actions/cache/save@v4
         with:
-          path: |
-            .ccache
+          path: .ccache
           key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-${{ github.sha }}
 
   test:
@@ -96,12 +92,10 @@ jobs:
           path: build/release
 
       - name: Ensure test runner is executable
-        run: |
-          chmod +x ./build/release/test/unittest
+        run: chmod +x ./build/release/test/unittest
 
       - name: Run tests
-        run: |
-          ./build/release/test/unittest "test/*"
+        run: ./build/release/test/unittest "test/*"
 
   test_s3:
     name: Test S3 (MinIO)
@@ -117,8 +111,7 @@ jobs:
           path: build/release
 
       - name: Ensure test runner is executable
-        run: |
-          chmod +x ./build/release/test/unittest
+        run: chmod +x ./build/release/test/unittest
 
       - name: Start MinIO
         run: |
@@ -153,8 +146,7 @@ jobs:
       - name: Run S3 tests
         env:
           LANCE_TEST_S3: "1"
-        run: |
-          ./build/release/test/unittest "test/*"
+        run: ./build/release/test/unittest "test/*"
 
       - name: Cleanup MinIO
         if: always()

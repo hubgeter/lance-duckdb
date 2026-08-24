@@ -18,6 +18,24 @@ SELECT count(*) FROM ns.main.truncate_table_test
 ----
 2
 
+# TRUNCATE is represented as a pending Lance delete transaction.  Rolling the
+# DuckDB transaction back must leave the dataset unchanged.
+statement ok
+BEGIN;
+
+query I
+TRUNCATE TABLE ns.main.truncate_table_test;
+----
+2
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ns.main.truncate_table_test
+----
+2
+
 statement ok
 TRUNCATE TABLE ns.main.truncate_table_test;
 
@@ -36,3 +54,21 @@ SELECT sum(id) FROM ns.main.truncate_table_test
 
 statement ok
 DETACH ns;
+
+statement ok
+ATTACH 'test/.tmp' AS readonly_ns (TYPE LANCE, READ_ONLY true);
+
+# The internal table function is reachable from SQL and must enforce the same
+# catalog mutability contract as the TRUNCATE parser extension.
+statement error
+SELECT * FROM __lance_truncate_table('readonly_ns', 'main', 'truncate_table_test');
+----
+Invalid Input Error: TRUNCATE TABLE cannot modify a Lance table through an attachment in read-only mode
+
+query I
+SELECT count(*) FROM readonly_ns.main.truncate_table_test
+----
+1
+
+statement ok
+DETACH readonly_ns;

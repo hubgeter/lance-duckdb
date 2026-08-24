@@ -2,24 +2,29 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::io::Cursor;
 use std::ptr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::{FileReader, StreamReader};
 use datafusion_expr::Expr;
 use datafusion_sql::unparser::dialect::CustomDialectBuilder;
 use datafusion_sql::unparser::Unparser;
+use lance_core::Error as LanceError;
 use lance_namespace::models::{
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestFullTextQuery,
     QueryTableRequestVector, StringFtsQuery,
 };
-use lance_namespace::LanceNamespace;
+use lance_namespace::{LanceNamespace, NamespaceError};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::StreamHandle;
-use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
+use super::util::{
+    cstr_to_str, parse_headers_tsv, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
+};
 
 const NAMESPACE_KIND_DIRECTORY: u8 = 0;
 const NAMESPACE_KIND_REST: u8 = 1;
@@ -39,7 +44,10 @@ pub struct LanceNamespaceQueryConfig {
     headers_tsv: *const c_char,
     columns: *const *const c_char,
     columns_len: usize,
+    expected_columns: *const *const c_char,
+    expected_columns_len: usize,
     filter: *const c_char,
+    dataset_version: u64,
     k: u64,
     prefilter: u8,
 }
@@ -78,7 +86,9 @@ struct ParsedNamespaceQueryConfig {
     backend: NamespaceBackend,
     table_id: String,
     columns: Vec<String>,
+    expected_columns: Vec<String>,
     filter: Option<String>,
+    dataset_version: i64,
     k: i32,
     prefilter: bool,
 }
@@ -146,20 +156,31 @@ unsafe fn parse_storage_options(
     Ok(keys.into_iter().zip(values).collect())
 }
 
-fn parse_headers_tsv(headers_tsv: Option<&str>) -> Vec<(String, String)> {
-    headers_tsv
-        .map(|tsv| {
-            tsv.lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(2, '\t');
-                    match (parts.next(), parts.next()) {
-                        (Some(k), Some(v)) if !k.is_empty() => Some((k.to_string(), v.to_string())),
-                        _ => None,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn validate_rest_table_id(table_id: &str, delimiter: Option<&str>) -> FfiResult<()> {
+    if delimiter == Some("") {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace delimiter must not be empty",
+        ));
+    }
+    let delimiter = delimiter.unwrap_or("$");
+    if !table_id.split(delimiter).any(|segment| !segment.is_empty()) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace table id must identify a table",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_namespace_location(value: &str, what: &'static str) -> FfiResult<()> {
+    if value.trim().is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} must not be empty"),
+        ));
+    }
+    Ok(())
 }
 
 unsafe fn parse_config(
@@ -173,8 +194,33 @@ unsafe fn parse_config(
     }
     let config = unsafe { &*config };
     let table_id = unsafe { cstr_to_str(config.table_id, "table_id")? }.to_string();
+    if table_id.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace table id must not be empty",
+        ));
+    }
     let columns = unsafe { parse_string_array(config.columns, config.columns_len, "columns")? };
+    let expected_columns = unsafe {
+        parse_string_array(
+            config.expected_columns,
+            config.expected_columns_len,
+            "expected_columns",
+        )?
+    };
     let filter = unsafe { optional_cstr_to_string(config.filter, "filter")? };
+    let dataset_version = i64::try_from(config.dataset_version).map_err(|_| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "dataset version must fit in i64",
+        )
+    })?;
+    if dataset_version <= 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "dataset version must be greater than zero",
+        ));
+    }
     let k = if config.k > i32::MAX as u64 {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
@@ -187,6 +233,7 @@ unsafe fn parse_config(
     let backend = match config.namespace_kind {
         NAMESPACE_KIND_DIRECTORY => {
             let root = unsafe { cstr_to_str(config.root, "root")? }.to_string();
+            validate_namespace_location(&root, "namespace root")?;
             let storage_options = unsafe {
                 parse_storage_options(config.option_keys, config.option_values, config.options_len)?
             };
@@ -197,13 +244,22 @@ unsafe fn parse_config(
         }
         NAMESPACE_KIND_REST => {
             let endpoint = unsafe { cstr_to_str(config.endpoint, "endpoint")? }.to_string();
+            validate_namespace_location(&endpoint, "namespace endpoint")?;
             let bearer_token =
                 unsafe { optional_cstr_to_string(config.bearer_token, "bearer_token")? };
             let api_key = unsafe { optional_cstr_to_string(config.api_key, "api_key")? };
-            let delimiter = unsafe { optional_cstr_to_string(config.delimiter, "delimiter")? };
+            // Unlike optional credentials, an explicitly empty delimiter is
+            // not equivalent to omission: `str::split("")` would corrupt the
+            // table identity into character-sized segments.
+            let delimiter = if config.delimiter.is_null() {
+                None
+            } else {
+                Some(unsafe { cstr_to_str(config.delimiter, "delimiter")? }.to_string())
+            };
+            validate_rest_table_id(&table_id, delimiter.as_deref())?;
             let headers_tsv =
                 unsafe { optional_cstr_to_string(config.headers_tsv, "headers_tsv")? };
-            let headers = parse_headers_tsv(headers_tsv.as_deref());
+            let headers = parse_headers_tsv(headers_tsv.as_deref())?;
             NamespaceBackend::Rest {
                 endpoint,
                 bearer_token,
@@ -224,7 +280,9 @@ unsafe fn parse_config(
         backend,
         table_id,
         columns,
+        expected_columns,
         filter,
+        dataset_version,
         k,
         prefilter: config.prefilter != 0,
     })
@@ -237,12 +295,14 @@ fn apply_base_request(config: &ParsedNamespaceQueryConfig, request: &mut QueryTa
             config
                 .table_id
                 .split(delimiter)
+                .filter(|segment| !segment.is_empty())
                 .map(str::to_string)
                 .collect()
         }
         NamespaceBackend::Directory { .. } => vec![config.table_id.clone()],
     });
     request.prefilter = Some(config.prefilter);
+    request.version = Some(config.dataset_version);
     if !config.columns.is_empty() {
         let mut columns = QueryTableRequestColumns::new();
         columns.column_names = Some(config.columns.clone());
@@ -253,18 +313,41 @@ fn apply_base_request(config: &ParsedNamespaceQueryConfig, request: &mut QueryTa
     }
 }
 
-async fn execute_query_table(
-    config: ParsedNamespaceQueryConfig,
-    request: QueryTableRequest,
-) -> FfiResult<Vec<u8>> {
-    match config.backend {
+const NAMESPACE_SCAN_PAGE_ROWS: i32 = 16_384;
+const REST_QUERY_ATTEMPTS: usize = 3;
+const REST_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PreparedNamespace {
+    namespace: Arc<dyn LanceNamespace>,
+    is_rest: bool,
+}
+
+fn is_retryable_rest_query_error(error: &LanceError) -> bool {
+    match error {
+        LanceError::Timeout { .. } => true,
+        LanceError::Namespace { source, .. } => source
+            .downcast_ref::<NamespaceError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    NamespaceError::ServiceUnavailable { .. }
+                        | NamespaceError::Throttling { .. }
+                        | NamespaceError::Internal { .. }
+                )
+            }),
+        _ => false,
+    }
+}
+
+async fn prepare_namespace(backend: &NamespaceBackend) -> FfiResult<PreparedNamespace> {
+    match backend {
         NamespaceBackend::Directory {
             root,
             storage_options,
         } => {
-            let mut builder = DirectoryNamespaceBuilder::new(&root).manifest_enabled(false);
+            let mut builder = DirectoryNamespaceBuilder::new(root.as_str()).manifest_enabled(false);
             if !storage_options.is_empty() {
-                builder = builder.storage_options(storage_options);
+                builder = builder.storage_options(storage_options.clone());
             }
             let namespace = builder.build().await.map_err(|err| {
                 FfiError::new(
@@ -272,16 +355,10 @@ async fn execute_query_table(
                     format!("dir namespace build '{root}': {err}"),
                 )
             })?;
-            namespace
-                .query_table(request)
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|err| {
-                    FfiError::new(
-                        ErrorCode::NamespaceQueryTable,
-                        format!("dir namespace query_table: {err}"),
-                    )
-                })
+            Ok(PreparedNamespace {
+                namespace: Arc::new(namespace),
+                is_rest: false,
+            })
         }
         NamespaceBackend::Rest {
             endpoint,
@@ -290,7 +367,7 @@ async fn execute_query_table(
             delimiter,
             headers,
         } => {
-            let mut builder = RestNamespaceBuilder::new(&endpoint);
+            let mut builder = RestNamespaceBuilder::new(endpoint.as_str());
             if let Some(token) = bearer_token {
                 builder = builder.header("Authorization", format!("Bearer {token}"));
             }
@@ -303,45 +380,200 @@ async fn execute_query_table(
             if let Some(delimiter) = delimiter {
                 builder = builder.delimiter(delimiter);
             }
-            let namespace = builder.build();
-            namespace
-                .query_table(request)
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|err| {
-                    FfiError::new(
-                        ErrorCode::NamespaceQueryTable,
-                        format!("namespace query_table: {err}"),
-                    )
-                })
+            Ok(PreparedNamespace {
+                namespace: Arc::new(builder.build()),
+                is_rest: true,
+            })
         }
     }
 }
 
-fn ipc_bytes_to_batches(bytes: Vec<u8>) -> FfiResult<Vec<RecordBatch>> {
-    match FileReader::try_new(Cursor::new(bytes.clone()), None) {
-        Ok(reader) => reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
+async fn execute_query_table(
+    prepared: &PreparedNamespace,
+    request: &QueryTableRequest,
+) -> FfiResult<Vec<u8>> {
+    let attempts = if prepared.is_rest {
+        REST_QUERY_ATTEMPTS
+    } else {
+        1
+    };
+    let mut last_error = String::new();
+
+    for attempt in 1..=attempts {
+        let query = prepared.namespace.query_table(request.clone());
+        let result = if prepared.is_rest {
+            match tokio::time::timeout(REST_QUERY_TIMEOUT, query).await {
+                Ok(result) => result,
+                Err(_) => {
+                    last_error = format!(
+                        "REST namespace query_table timed out after {} seconds",
+                        REST_QUERY_TIMEOUT.as_secs()
+                    );
+                    if attempt < attempts {
+                        log::warn!("{last_error}; retrying ({}/{})", attempt + 1, attempts);
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        } else {
+            query.await
+        };
+
+        match result {
+            Ok(bytes) => return Ok(bytes.to_vec()),
+            Err(err) => {
+                last_error = if prepared.is_rest {
+                    format!("REST namespace query_table: {err}")
+                } else {
+                    format!("directory namespace query_table: {err}")
+                };
+                if prepared.is_rest && !is_retryable_rest_query_error(&err) {
+                    return Err(FfiError::new(ErrorCode::NamespaceQueryTable, last_error));
+                }
+                if attempt < attempts {
+                    log::warn!(
+                        "{last_error}; retrying idempotent query ({}/{})",
+                        attempt + 1,
+                        attempts
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+
+    Err(FfiError::new(ErrorCode::NamespaceQueryTable, last_error))
+}
+
+fn reorder_response_batches(
+    batches: Vec<RecordBatch>,
+    schema: &arrow::datatypes::Schema,
+    expected_columns: &[String],
+) -> FfiResult<Vec<RecordBatch>> {
+    if expected_columns.is_empty() {
+        return Ok(batches);
+    }
+
+    if schema.fields().len() != expected_columns.len() {
+        return Err(FfiError::new(
+            ErrorCode::NamespaceQueryTable,
+            format!(
+                "namespace query_table schema mismatch: expected columns {:?} ({}), got {} columns {:?}",
+                expected_columns,
+                expected_columns.len(),
+                schema.fields().len(),
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>()
+            ),
+        ));
+    }
+
+    let mut actual_indices = HashMap::with_capacity(schema.fields().len());
+    for (index, field) in schema.fields().iter().enumerate() {
+        if actual_indices
+            .insert(field.name().as_str(), index)
+            .is_some()
+        {
+            return Err(FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!(
+                    "namespace query_table returned duplicate column '{}'",
+                    field.name()
+                ),
+            ));
+        }
+    }
+
+    let mut seen_expected = std::collections::HashSet::with_capacity(expected_columns.len());
+    let mut order = Vec::with_capacity(expected_columns.len());
+    for column in expected_columns {
+        if !seen_expected.insert(column.as_str()) {
+            return Err(FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("namespace query_table expected duplicate column '{column}'"),
+            ));
+        }
+        let index = actual_indices
+            .get(column.as_str())
+            .copied()
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::NamespaceQueryTable,
+                    format!(
+                        "namespace query_table schema mismatch: did not return expected column '{column}'"
+                    ),
+                )
+            })?;
+        order.push(index);
+    }
+
+    if order.iter().copied().eq(0..order.len()) {
+        return Ok(batches);
+    }
+
+    let reordered_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        order
+            .iter()
+            .map(|index| schema.field(*index).clone())
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ));
+    batches
+        .into_iter()
+        .map(|batch| {
+            let columns = order
+                .iter()
+                .map(|index| batch.column(*index).clone())
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(reordered_schema.clone(), columns).map_err(|error| {
+                FfiError::new(
+                    ErrorCode::NamespaceQueryTable,
+                    format!("reorder namespace query_table response: {error}"),
+                )
+            })
+        })
+        .collect()
+}
+
+fn ipc_bytes_to_batches(
+    bytes: Vec<u8>,
+    expected_columns: &[String],
+) -> FfiResult<Vec<RecordBatch>> {
+    if bytes.starts_with(b"ARROW1") {
+        let reader = FileReader::try_new(Cursor::new(bytes), None).map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("open Arrow IPC file response: {err}"),
+            )
+        })?;
+        let schema = reader.schema();
+        let batches = reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
             FfiError::new(
                 ErrorCode::NamespaceQueryTable,
                 format!("read Arrow IPC file: {err}"),
             )
-        }),
-        Err(file_err) => {
-            let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|stream_err| {
-                FfiError::new(
-                    ErrorCode::NamespaceQueryTable,
-                    format!(
-                        "read Arrow IPC response: file reader failed: {file_err}; stream reader failed: {stream_err}"
-                    ),
-                )
-            })?;
-            reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
-                FfiError::new(
-                    ErrorCode::NamespaceQueryTable,
-                    format!("read Arrow IPC stream: {err}"),
-                )
-            })
-        }
+        })?;
+        reorder_response_batches(batches, schema.as_ref(), expected_columns)
+    } else {
+        let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("open Arrow IPC stream response: {err}"),
+            )
+        })?;
+        let schema = reader.schema();
+        let batches = reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("read Arrow IPC stream: {err}"),
+            )
+        })?;
+        reorder_response_batches(batches, schema.as_ref(), expected_columns)
     }
 }
 
@@ -349,10 +581,128 @@ fn execute_to_stream(
     config: ParsedNamespaceQueryConfig,
     request: QueryTableRequest,
 ) -> FfiResult<StreamHandle> {
-    let bytes = runtime::block_on(execute_query_table(config, request))
+    let prepared = runtime::block_on(prepare_namespace(&config.backend))
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
-    let batches = ipc_bytes_to_batches(bytes)?;
+    let bytes = runtime::block_on(execute_query_table(&prepared, &request))
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+    let batches = ipc_bytes_to_batches(bytes, &config.expected_columns)?;
     Ok(StreamHandle::Batches(batches.into_iter()))
+}
+
+pub(crate) struct NamespaceQueryStream {
+    prepared: PreparedNamespace,
+    request: QueryTableRequest,
+    expected_columns: Vec<String>,
+    next_offset: i64,
+    remaining: Option<u64>,
+    pending: std::vec::IntoIter<RecordBatch>,
+    done: bool,
+}
+
+impl NamespaceQueryStream {
+    fn try_new(config: ParsedNamespaceQueryConfig, request: QueryTableRequest) -> FfiResult<Self> {
+        if request.k < 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "namespace scan k must be non-negative",
+            ));
+        }
+        let prepared = runtime::block_on(prepare_namespace(&config.backend))
+            .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+        let mut stream = Self {
+            prepared,
+            next_offset: i64::from(request.offset.unwrap_or(0)),
+            remaining: (request.k != 0).then_some(request.k as u64),
+            request,
+            expected_columns: config.expected_columns,
+            pending: Vec::new().into_iter(),
+            done: false,
+        };
+        // Execute the first page while constructing the stream.  The C++ scan
+        // layer can safely fall back to DuckDB-side filtering only when a
+        // rejected pushed filter is reported by stream creation; deferring the
+        // request until lance_stream_next would turn that recoverable bind-time
+        // failure into a mid-scan query failure.
+        stream.fetch_page()?;
+        Ok(stream)
+    }
+
+    fn fetch_page(&mut self) -> FfiResult<()> {
+        let page_rows = self
+            .remaining
+            .map(|remaining| remaining.min(NAMESPACE_SCAN_PAGE_ROWS as u64))
+            .unwrap_or(NAMESPACE_SCAN_PAGE_ROWS as u64) as i32;
+        if page_rows == 0 {
+            self.done = true;
+            return Ok(());
+        }
+
+        let mut request = self.request.clone();
+        request.k = page_rows;
+        request.offset = if self.next_offset == 0 {
+            None
+        } else {
+            Some(i32::try_from(self.next_offset).map_err(|_| {
+                FfiError::new(
+                    ErrorCode::NamespaceQueryTable,
+                    "namespace scan offset exceeds the query_table i32 limit",
+                )
+            })?)
+        };
+        let bytes = runtime::block_on(execute_query_table(&self.prepared, &request))
+            .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+        let batches = ipc_bytes_to_batches(bytes, &self.expected_columns)?;
+        let returned_rows = batches.iter().try_fold(0_u64, |rows, batch| {
+            rows.checked_add(batch.num_rows() as u64).ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::NamespaceQueryTable,
+                    "namespace query_table response row count overflow",
+                )
+            })
+        })?;
+        if returned_rows > page_rows as u64 {
+            return Err(FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!(
+                    "namespace query_table returned {returned_rows} rows for a {page_rows}-row page"
+                ),
+            ));
+        }
+        if returned_rows == 0 {
+            self.done = true;
+            return Ok(());
+        }
+
+        self.next_offset = self
+            .next_offset
+            .checked_add(returned_rows as i64)
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::NamespaceQueryTable,
+                    "namespace scan offset overflow",
+                )
+            })?;
+        if let Some(remaining) = self.remaining.as_mut() {
+            *remaining -= returned_rows;
+            if *remaining == 0 {
+                self.done = true;
+            }
+        }
+        self.pending = batches.into_iter();
+        Ok(())
+    }
+
+    pub(crate) fn next_batch(&mut self) -> FfiResult<Option<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.pending.next() {
+                return Ok(Some(batch));
+            }
+            if self.done {
+                return Ok(None);
+            }
+            self.fetch_page()?;
+        }
+    }
 }
 
 fn filter_expr_to_sql(expr: &Expr) -> FfiResult<String> {
@@ -443,6 +793,7 @@ fn build_namespace_scan_request(
     Ok(request)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_namespace_scan_stream_ir(
     config: *const LanceNamespaceQueryConfig,
@@ -500,9 +851,12 @@ unsafe fn create_namespace_scan_stream_ir_inner(
     if limit == 0 {
         return Ok(StreamHandle::Batches(Vec::new().into_iter()));
     }
-    execute_to_stream(config, request)
+    Ok(StreamHandle::Namespace(Box::new(
+        NamespaceQueryStream::try_new(config, request)?,
+    )))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_namespace_vector_search_stream(
     config: *const LanceNamespaceQueryConfig,
@@ -569,6 +923,7 @@ unsafe fn create_namespace_vector_search_stream_inner(
     execute_to_stream(config, request)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_namespace_fts_search_stream(
     config: *const LanceNamespaceQueryConfig,
@@ -621,6 +976,11 @@ unsafe fn create_namespace_fts_search_stream_inner(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::{FileWriter, StreamWriter};
     use datafusion_expr::{col, lit};
 
     use super::*;
@@ -636,10 +996,54 @@ mod tests {
             },
             table_id: "parent$child$table".to_string(),
             columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            expected_columns: columns.iter().map(|column| (*column).to_string()).collect(),
             filter: None,
+            dataset_version: 42,
             k: 0,
             prefilter: true,
         }
+    }
+
+    #[test]
+    fn namespace_query_retries_only_transient_rest_errors() {
+        let transient: LanceError = NamespaceError::ServiceUnavailable {
+            message: "temporary".to_string(),
+        }
+        .into();
+        let deterministic: LanceError = NamespaceError::InvalidInput {
+            message: "invalid request".to_string(),
+        }
+        .into();
+
+        assert!(is_retryable_rest_query_error(&transient));
+        assert!(!is_retryable_rest_query_error(&deterministic));
+    }
+
+    #[test]
+    fn namespace_query_table_ids_drop_empty_segments() {
+        let mut config = rest_config(&["id"]);
+        config.table_id = "$parent$$table$".to_string();
+        let mut request = QueryTableRequest::new(1, QueryTableRequestVector::new());
+        apply_base_request(&config, &mut request);
+        assert_eq!(
+            request.id,
+            Some(vec!["parent".to_string(), "table".to_string()])
+        );
+    }
+
+    #[test]
+    fn namespace_query_rejects_empty_delimiter_and_root_table_id() {
+        assert!(validate_rest_table_id("table", Some("")).is_err());
+        assert!(validate_rest_table_id("$$", Some("$")).is_err());
+        assert!(validate_rest_table_id("$table$", Some("$")).is_ok());
+    }
+
+    #[test]
+    fn namespace_query_rejects_empty_locations() {
+        assert!(validate_namespace_location("", "namespace root").is_err());
+        assert!(validate_namespace_location("  ", "namespace endpoint").is_err());
+        assert!(validate_namespace_location("/", "namespace root").is_ok());
+        assert!(validate_namespace_location("file:///", "namespace root").is_ok());
     }
 
     #[test]
@@ -657,6 +1061,7 @@ mod tests {
             ])
         );
         assert_eq!(request.k, 5);
+        assert_eq!(request.version, Some(42));
         assert_eq!(request.offset, Some(2));
         assert_eq!(request.with_row_id, Some(true));
         assert_eq!(request.prefilter, None);
@@ -674,5 +1079,83 @@ mod tests {
         let config = rest_config(&["name"]);
         let error = build_namespace_scan_request(&config, None, -1, 1, false).unwrap_err();
         assert!(error.message.contains("cannot apply OFFSET without LIMIT"));
+    }
+
+    fn ipc_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap()
+    }
+
+    #[test]
+    fn namespace_query_reads_stream_and_validates_schema() {
+        let batch = ipc_batch();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let batches = ipc_bytes_to_batches(bytes.clone(), &["id".to_string()]).unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        let error = ipc_bytes_to_batches(bytes, &["wrong".to_string()]).unwrap_err();
+        assert!(error.message.contains("schema mismatch"));
+        assert!(!error.message.contains("localhost"));
+    }
+
+    #[test]
+    fn namespace_query_reads_file_and_validates_column_order() {
+        let batch = ipc_batch();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = FileWriter::try_new(&mut bytes, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let batches = ipc_bytes_to_batches(bytes.clone(), &["id".to_string()]).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let error =
+            ipc_bytes_to_batches(bytes, &["id".to_string(), "extra".to_string()]).unwrap_err();
+        assert!(error.message.contains("expected columns"));
+    }
+
+    #[test]
+    fn namespace_query_reorders_response_columns_by_name() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_rowid", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let batches =
+            ipc_bytes_to_batches(bytes, &["_rowid".to_string(), "id".to_string()]).unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.schema().field(0).name(), "_rowid");
+        assert_eq!(batch.schema().field(1).name(), "id");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[100, 200]
+        );
     }
 }

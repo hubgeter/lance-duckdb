@@ -25,6 +25,7 @@ struct LanceNamespaceTableConfig {
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+  bool requires_worker_auth = false;
   string display_uri;
 
   bool IsDirectory() const { return kind == LanceNamespaceKind::Directory; }

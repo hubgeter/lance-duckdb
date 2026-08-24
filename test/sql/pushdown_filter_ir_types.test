@@ -61,6 +61,13 @@ SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a IS NULL;
 ----
 1
 
+# Multiple struct children are sibling projection hints, not a nested path.
+# The scan may decline expression pushdown, but it must preserve SQL results.
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a = 2 AND s.b = 'y';
+----
+1
+
 # Verify we can encode these predicates into ExecIR (and avoid scanning into DuckDB).
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE ts_us >= TIMESTAMP '2020-01-02 00:00:00';

@@ -1,12 +1,12 @@
 #include "duckdb.hpp"
 
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
+#include "lance_lease.hpp"
 #include "lance_resolver.hpp"
 
 namespace duckdb {
@@ -19,41 +19,20 @@ enum class LanceKvTarget : uint8_t {
   INDICES = 5,
 };
 
-static vector<pair<string, string>> ParseTsvRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read metadata from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
-
 struct LanceKvUpdateBindData final : public FunctionData {
-  LanceKvUpdateBindData(string dataset_uri_p, LanceKvTarget target_p,
-                        string key_p, bool has_value_p, string value_p,
-                        string field_path_p, string index_column_p,
-                        string index_name_p)
-      : dataset_uri(std::move(dataset_uri_p)), target(target_p),
+  LanceKvUpdateBindData(string dataset_uri_p, string input_str_p,
+                        LanceKvTarget target_p, string key_p, bool has_value_p,
+                        string value_p, string field_path_p,
+                        string index_column_p, string index_name_p)
+      : dataset_uri(std::move(dataset_uri_p)),
+        input_str(std::move(input_str_p)), target(target_p),
         key(std::move(key_p)), has_value(has_value_p),
         value(std::move(value_p)), field_path(std::move(field_path_p)),
         index_column(std::move(index_column_p)),
         index_name(std::move(index_name_p)) {}
 
   string dataset_uri;
+  string input_str;
   LanceKvTarget target;
   string key;
   bool has_value = false;
@@ -63,38 +42,42 @@ struct LanceKvUpdateBindData final : public FunctionData {
   string index_name;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceKvUpdateBindData>(dataset_uri, target, key, has_value,
-                                            value, field_path, index_column,
-                                            index_name);
+    return make_uniq<LanceKvUpdateBindData>(dataset_uri, input_str, target, key,
+                                            has_value, value, field_path,
+                                            index_column, index_name);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceKvUpdateBindData>();
-    return dataset_uri == other.dataset_uri && target == other.target &&
-           key == other.key && has_value == other.has_value &&
-           value == other.value && field_path == other.field_path &&
+    return dataset_uri == other.dataset_uri && input_str == other.input_str &&
+           target == other.target && key == other.key &&
+           has_value == other.has_value && value == other.value &&
+           field_path == other.field_path &&
            index_column == other.index_column && index_name == other.index_name;
   }
 };
 
 struct LanceKvListBindData final : public FunctionData {
-  LanceKvListBindData(string dataset_uri_p, LanceKvTarget target_p,
-                      string field_path_p)
-      : dataset_uri(std::move(dataset_uri_p)), target(target_p),
+  LanceKvListBindData(string dataset_uri_p, string input_str_p,
+                      LanceKvTarget target_p, string field_path_p)
+      : dataset_uri(std::move(dataset_uri_p)),
+        input_str(std::move(input_str_p)), target(target_p),
         field_path(std::move(field_path_p)) {}
 
   string dataset_uri;
+  string input_str;
   LanceKvTarget target;
   string field_path;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceKvListBindData>(dataset_uri, target, field_path);
+    return make_uniq<LanceKvListBindData>(dataset_uri, input_str, target,
+                                          field_path);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceKvListBindData>();
-    return dataset_uri == other.dataset_uri && target == other.target &&
-           field_path == other.field_path;
+    return dataset_uri == other.dataset_uri && input_str == other.input_str &&
+           target == other.target && field_path == other.field_path;
   }
 };
 
@@ -107,6 +90,52 @@ LanceSingleRowInitGlobal(ClientContext &, TableFunctionInitInput &) {
   return make_uniq<LanceSingleRowGlobalState>();
 }
 
+static void RequireImmediateLanceMutationAutocommit(ClientContext &context,
+                                                    const string &operation) {
+  if (!context.transaction.IsAutoCommit()) {
+    throw NotImplementedException(
+        operation +
+        " does not support explicit transactions because its Lance commit "
+        "cannot be rolled back by DuckDB");
+  }
+}
+
+static void *OpenLanceMetadataDataset(ClientContext &context,
+                                      const string &dataset_uri,
+                                      string &display_uri,
+                                      LanceTableEntry *table) {
+  if (table) {
+    return LanceOpenDatasetForTable(context, *table, display_uri);
+  }
+  display_uri = dataset_uri;
+  return LanceOpenDataset(context, dataset_uri);
+}
+
+static string BuildLanceMetadataDatasetCacheKey(ClientContext &context,
+                                                LanceTableEntry *table,
+                                                const string &dataset_uri) {
+  if (table) {
+    return LanceBuildDatasetCacheKeyForTable(context, *table);
+  }
+  return LanceBuildPathDatasetCacheKey(context, dataset_uri);
+}
+
+template <class FUNC>
+static void FinishCommittedLanceMetadataResult(const string &operation,
+                                               FUNC &&finish) {
+  try {
+    finish();
+  } catch (const std::exception &error) {
+    throw IOException(operation +
+                      " committed, but preparing its SQL result failed: " +
+                      string(error.what()) + " (code=55)");
+  } catch (...) {
+    throw IOException(operation +
+                      " committed, but preparing its SQL result failed with "
+                      "an unknown error (code=55)");
+  }
+}
+
 static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
                               DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceSingleRowGlobalState>();
@@ -117,11 +146,28 @@ static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceKvUpdateBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  string display_uri;
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  auto cache_key =
+      BuildLanceMetadataDatasetCacheKey(context, table, bind_data.dataset_uri);
+  void *dataset = OpenLanceMetadataDataset(context, bind_data.dataset_uri,
+                                           display_uri, table);
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
+  unique_ptr<LanceLease> mutation_lease;
+  try {
+    mutation_lease = LanceLease::AcquireForDataset(
+        dataset, LanceLeaseKind::Mutation, "metadata:" + display_uri);
+  } catch (...) {
+    lance_close_dataset(dataset);
+    throw;
+  }
+  // Every potentially failing cache-key dependency was resolved before the
+  // dataset was opened.  Once the FFI call returns success, invalidation itself
+  // is a non-throwing in-memory operation and cannot turn a committed mutation
+  // into an apparently retryable failure.
 
   const char *value_ptr =
       bind_data.has_value ? bind_data.value.c_str() : nullptr;
@@ -156,13 +202,23 @@ static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
 
   lance_close_dataset(dataset);
   if (rc != 0) {
-    throw IOException("Failed to update Lance dataset: " +
-                      bind_data.dataset_uri + LanceFormatErrorSuffix());
+    throw IOException("Failed to update Lance dataset: " + display_uri +
+                      LanceFormatErrorSuffix());
   }
-  LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
-
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BIGINT(1));
+  LanceInvalidateDatasetCache(context, cache_key);
+  try {
+    mutation_lease->Release();
+    mutation_lease.reset();
+  } catch (...) {
+    mutation_lease->RetainForReconciliation();
+    throw IOException(
+        "Lance metadata mutation committed, but mutation lease release "
+        "failed; do not retry automatically (code=55)");
+  }
+  FinishCommittedLanceMetadataResult("Lance metadata mutation", [&] {
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BIGINT(1));
+  });
 }
 
 static unique_ptr<FunctionData>
@@ -173,8 +229,15 @@ LanceKvUpdateBind(ClientContext &context, TableFunctionBindInput &input,
     throw BinderException("invalid argument count");
   }
 
+  RequireImmediateLanceMutationAutocommit(context, "Lance metadata mutation");
+
   auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::STRICT, "lance_metadata");
+      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
+      "lance_metadata");
+  auto input_str = input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance metadata mutation");
+  }
 
   string key;
   bool has_value = false;
@@ -189,6 +252,9 @@ LanceKvUpdateBind(ClientContext &context, TableFunctionBindInput &input,
     }
     index_column = input.inputs[1].GetValue<string>();
     index_name = input.inputs[2].GetValue<string>();
+    if (index_column.empty() || index_name.empty()) {
+      throw BinderException("index column and index name cannot be empty");
+    }
   } else {
     if (input.inputs.size() >= 2 && !input.inputs[1].IsNull()) {
       key = input.inputs[1].GetValue<string>();
@@ -225,12 +291,20 @@ LanceKvUpdateBind(ClientContext &context, TableFunctionBindInput &input,
     }
   }
 
+  ValidateLanceCString(key, "Lance metadata key");
+  if (has_value) {
+    ValidateLanceCString(value, "Lance metadata value");
+  }
+  ValidateLanceCString(field_path, "Lance metadata column name");
+  ValidateLanceCString(index_column, "Lance index column");
+  ValidateLanceCString(index_name, "Lance index name");
+
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
   return make_uniq<LanceKvUpdateBindData>(
-      std::move(dataset_uri), target, std::move(key), has_value,
-      std::move(value), std::move(field_path), std::move(index_column),
-      std::move(index_name));
+      std::move(dataset_uri), std::move(input_str), target, std::move(key),
+      has_value, std::move(value), std::move(field_path),
+      std::move(index_column), std::move(index_name));
 }
 
 struct LanceKvListGlobalState final : public GlobalTableFunctionState {
@@ -244,9 +318,12 @@ struct LanceKvListGlobalState final : public GlobalTableFunctionState {
 static unique_ptr<GlobalTableFunctionState>
 LanceKvListInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKvListBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  string display_uri;
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  void *dataset = OpenLanceMetadataDataset(context, bind_data.dataset_uri,
+                                           display_uri, table);
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
@@ -275,7 +352,7 @@ LanceKvListInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
   vector<pair<string, string>> rows;
   try {
-    rows = ParseTsvRows(ptr);
+    rows = ParseLanceKeyValueRows(ptr, "Lance dataset metadata");
   } catch (...) {
     lance_close_dataset(dataset);
     throw;
@@ -314,7 +391,9 @@ LanceKvListBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::STRICT, "lance_metadata");
+      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
+      "lance_metadata");
+  auto input_str = input.inputs[0].GetValue<string>();
 
   string field_path;
   if (target == LanceKvTarget::FIELD_METADATA) {
@@ -325,11 +404,13 @@ LanceKvListBind(ClientContext &context, TableFunctionBindInput &input,
     if (field_path.empty()) {
       throw BinderException("column name cannot be empty");
     }
+    ValidateLanceCString(field_path, "Lance metadata column name");
   }
 
   return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
   names = {"Key", "Value"};
-  return make_uniq<LanceKvListBindData>(std::move(dataset_uri), target,
+  return make_uniq<LanceKvListBindData>(std::move(dataset_uri),
+                                        std::move(input_str), target,
                                         std::move(field_path));
 }
 
@@ -425,24 +506,27 @@ LanceIndicesBind(ClientContext &context, TableFunctionBindInput &input,
 }
 
 struct LanceMaintenanceBindData final : public FunctionData {
-  LanceMaintenanceBindData(string dataset_uri_p, int64_t older_than_seconds_p,
+  LanceMaintenanceBindData(string dataset_uri_p, string input_str_p,
+                           int64_t older_than_seconds_p,
                            bool delete_unverified_p)
       : dataset_uri(std::move(dataset_uri_p)),
+        input_str(std::move(input_str_p)),
         older_than_seconds(older_than_seconds_p),
         delete_unverified(delete_unverified_p) {}
 
   string dataset_uri;
+  string input_str;
   int64_t older_than_seconds = 0;
   bool delete_unverified = false;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceMaintenanceBindData>(dataset_uri, older_than_seconds,
-                                               delete_unverified);
+    return make_uniq<LanceMaintenanceBindData>(
+        dataset_uri, input_str, older_than_seconds, delete_unverified);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceMaintenanceBindData>();
-    return dataset_uri == other.dataset_uri &&
+    return dataset_uri == other.dataset_uri && input_str == other.input_str &&
            older_than_seconds == other.older_than_seconds &&
            delete_unverified == other.delete_unverified;
   }
@@ -455,12 +539,18 @@ LanceCompactFilesBind(ClientContext &context, TableFunctionBindInput &input,
   if (input.inputs.size() != 1) {
     throw BinderException("lance_compact_files requires 1 argument");
   }
+  RequireImmediateLanceMutationAutocommit(context, "Lance compaction");
   auto dataset_uri = ResolveLanceDatasetUri(
       context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
       "lance_metadata");
+  auto input_str = input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance compaction");
+  }
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
-  return make_uniq<LanceMaintenanceBindData>(std::move(dataset_uri), 0, false);
+  return make_uniq<LanceMaintenanceBindData>(std::move(dataset_uri),
+                                             std::move(input_str), 0, false);
 }
 
 static unique_ptr<FunctionData> LanceCleanupOldVersionsBind(
@@ -469,9 +559,14 @@ static unique_ptr<FunctionData> LanceCleanupOldVersionsBind(
   if (input.inputs.size() != 3) {
     throw BinderException("lance_cleanup_old_versions requires 3 arguments");
   }
+  RequireImmediateLanceMutationAutocommit(context, "Lance cleanup");
   auto dataset_uri = ResolveLanceDatasetUri(
       context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
       "lance_metadata");
+  auto input_str = input.inputs[0].GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    RequireLanceTableWritable(*table, "Lance cleanup");
+  }
 
   int64_t older_than_seconds = 0;
   if (!input.inputs[1].IsNull()) {
@@ -486,7 +581,8 @@ static unique_ptr<FunctionData> LanceCleanupOldVersionsBind(
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
   return make_uniq<LanceMaintenanceBindData>(
-      std::move(dataset_uri), older_than_seconds, delete_unverified);
+      std::move(dataset_uri), std::move(input_str), older_than_seconds,
+      delete_unverified);
 }
 
 static void LanceCompactFilesFunc(ClientContext &context,
@@ -499,19 +595,27 @@ static void LanceCompactFilesFunc(ClientContext &context,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceMaintenanceBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  string display_uri;
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  auto cache_key =
+      BuildLanceMetadataDatasetCacheKey(context, table, bind_data.dataset_uri);
+  void *dataset = OpenLanceMetadataDataset(context, bind_data.dataset_uri,
+                                           display_uri, table);
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
   auto rc = lance_dataset_compact_files(dataset);
   lance_close_dataset(dataset);
   if (rc != 0) {
-    throw IOException("Failed to compact Lance dataset: " +
-                      bind_data.dataset_uri + LanceFormatErrorSuffix());
+    throw IOException("Failed to compact Lance dataset: " + display_uri +
+                      LanceFormatErrorSuffix());
   }
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BIGINT(1));
+  LanceInvalidateDatasetCache(context, cache_key);
+  FinishCommittedLanceMetadataResult("Lance compaction", [&] {
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BIGINT(1));
+  });
 }
 
 static void LanceCleanupOldVersionsFunc(ClientContext &context,
@@ -525,9 +629,14 @@ static void LanceCleanupOldVersionsFunc(ClientContext &context,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceMaintenanceBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  string display_uri;
+  auto *table = TryResolveLanceTableEntry(context, bind_data.input_str);
+  auto cache_key =
+      BuildLanceMetadataDatasetCacheKey(context, table, bind_data.dataset_uri);
+  void *dataset = OpenLanceMetadataDataset(context, bind_data.dataset_uri,
+                                           display_uri, table);
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
   auto rc =
@@ -536,10 +645,13 @@ static void LanceCleanupOldVersionsFunc(ClientContext &context,
   lance_close_dataset(dataset);
   if (rc != 0) {
     throw IOException("Failed to cleanup old versions for Lance dataset: " +
-                      bind_data.dataset_uri + LanceFormatErrorSuffix());
+                      display_uri + LanceFormatErrorSuffix());
   }
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value::BIGINT(1));
+  LanceInvalidateDatasetCache(context, cache_key);
+  FinishCommittedLanceMetadataResult("Lance cleanup", [&] {
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BIGINT(1));
+  });
 }
 
 void RegisterLanceMetadata(ExtensionLoader &loader) {

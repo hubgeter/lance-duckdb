@@ -1,9 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "lance-duckdb-devtools"
+name = "lance-duckdb"
 version = "0.1.0"
-description = "Developer tooling for DuckDB format.py"
-requires-python = ">=3.11"
+description = "Lance extension helpers for DuckDB and Vane"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+duckdb = ["duckdb"]
+vane = ["vane-ai"]
 
 [dependency-groups]
 format = [
@@ -13,6 +23,17 @@ format = [
     "cxxheaderparser>=1.6.2",
     "pcpp>=1.30",
 ]
+test = ["pytest>=8"]
 
 [tool.uv]
-default-groups = ["format"]
+default-groups = ["format", "test"]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["lance_duckdb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]

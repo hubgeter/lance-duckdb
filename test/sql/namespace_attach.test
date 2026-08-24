@@ -4,6 +4,11 @@
 
 require lance
 
+statement error
+ATTACH 'example' AS invalid_empty_endpoint (TYPE LANCE, ENDPOINT '');
+----
+Invalid Input Error: Invalid Lance ENDPOINT option: endpoint must not be empty
+
 statement ok
 ATTACH 'test/data' AS ns (TYPE LANCE);
 

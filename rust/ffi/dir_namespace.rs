@@ -15,7 +15,8 @@ use crate::runtime;
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::util::{
-    cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
+    cstr_to_str, ffi_output_string, join_ffi_lines, lance_mutation_error, optional_session_handle,
+    slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
 
 fn parse_storage_options(
@@ -67,6 +68,12 @@ fn dir_namespace_list_tables_inner(
     options_len: usize,
 ) -> FfiResult<Vec<String>> {
     let root = unsafe { cstr_to_str(root, "root")? };
+    if root.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "directory namespace root must not be empty",
+        ));
+    }
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
 
     let tables = runtime::block_on(async move {
@@ -96,6 +103,7 @@ fn dir_namespace_list_tables_inner(
     Ok(tables)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dir_namespace_list_tables(
     root: *const c_char,
@@ -105,9 +113,20 @@ pub unsafe extern "C" fn lance_dir_namespace_list_tables(
 ) -> *const c_char {
     match dir_namespace_list_tables_inner(root, option_keys, option_values, options_len) {
         Ok(tables) => {
-            clear_last_error();
-            let joined = tables.join("\n");
-            to_c_string(joined).into_raw() as *const c_char
+            match join_ffi_lines(
+                &tables,
+                ErrorCode::DirNamespaceListTables,
+                "directory namespace list_tables response",
+            ) {
+                Ok(joined) => {
+                    clear_last_error();
+                    to_c_string(joined).into_raw() as *const c_char
+                }
+                Err(err) => {
+                    set_last_error(err.code, err.message);
+                    ptr::null()
+                }
+            }
         }
         Err(err) => {
             set_last_error(err.code, err.message);
@@ -123,11 +142,17 @@ fn open_dataset_in_dir_namespace_inner(
     option_values: *const *const c_char,
     options_len: usize,
     session: *mut c_void,
-) -> FfiResult<(DatasetHandle, String)> {
-    let root = unsafe { cstr_to_str(root, "root")? }
-        .trim_end_matches('/')
-        .to_string();
+) -> FfiResult<(DatasetHandle, CString)> {
+    // Preserve trailing separators: trimming "/" or "file:///" would turn a
+    // valid filesystem root into an empty or malformed namespace URI.
+    let root = unsafe { cstr_to_str(root, "root")? }.to_string();
     let table_name = unsafe { cstr_to_str(table_name, "table_name")? };
+    if root.is_empty() || table_name.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "directory namespace root and table_name must not be empty",
+        ));
+    }
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
     let session = unsafe { optional_session_handle(session)? };
 
@@ -181,11 +206,16 @@ fn open_dataset_in_dir_namespace_inner(
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
-    let table_uri = dataset.uri().to_string();
+    let table_uri = ffi_output_string(
+        dataset.uri().to_string(),
+        ErrorCode::DatasetOpen,
+        "directory namespace dataset URI",
+    )?;
     record_dataset_open();
     Ok((DatasetHandle::new(Arc::new(dataset)), table_uri))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
     root: *const c_char,
@@ -212,9 +242,8 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
         Ok((handle, table_uri)) => {
             clear_last_error();
             if !out_table_uri.is_null() {
-                let uri_c = CString::new(table_uri).unwrap_or_else(|_| to_c_string("invalid uri"));
                 unsafe {
-                    std::ptr::write_unaligned(out_table_uri, uri_c.into_raw() as *const c_char);
+                    std::ptr::write_unaligned(out_table_uri, table_uri.into_raw() as *const c_char);
                 }
             }
             Box::into_raw(Box::new(handle)) as *mut c_void
@@ -226,6 +255,7 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace_with_session(
     root: *const c_char,
@@ -253,9 +283,8 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace_with_session(
         Ok((handle, table_uri)) => {
             clear_last_error();
             if !out_table_uri.is_null() {
-                let uri_c = CString::new(table_uri).unwrap_or_else(|_| to_c_string("invalid uri"));
                 unsafe {
-                    std::ptr::write_unaligned(out_table_uri, uri_c.into_raw() as *const c_char);
+                    std::ptr::write_unaligned(out_table_uri, table_uri.into_raw() as *const c_char);
                 }
             }
             Box::into_raw(Box::new(handle)) as *mut c_void
@@ -276,6 +305,12 @@ fn dir_namespace_drop_table_inner(
 ) -> FfiResult<()> {
     let root = unsafe { cstr_to_str(root, "root")? };
     let table_name = unsafe { cstr_to_str(table_name, "table_name")? };
+    if root.is_empty() || table_name.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "directory namespace root and table_name must not be empty",
+        ));
+    }
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
 
     runtime::block_on(async move {
@@ -296,15 +331,18 @@ fn dir_namespace_drop_table_inner(
         match namespace.drop_table(req).await {
             Ok(_) => Ok(()),
             Err(LanceError::NotFound { .. }) => Ok(()),
-            Err(err) => Err(FfiError::new(
+            Err(err) => Err(lance_mutation_error(
                 ErrorCode::DirNamespaceDropTable,
-                format!("dir namespace drop_table '{root}/{table_name}': {err}"),
+                ErrorCode::NamespaceMutationOutcomeUnknown,
+                &format!("directory namespace drop_table '{root}/{table_name}'"),
+                err,
             )),
         }
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
 }
 
+#[ffi_guard_macro::ffi_guard(namespace_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dir_namespace_drop_table(
     root: *const c_char,

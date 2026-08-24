@@ -1,0 +1,22 @@
+# name: test/sql/dual_build_smoke.test
+# description: Stable smoke test shared by official DuckDB and Vane builds
+# group: [sql]
+
+require lance
+
+# The same extension source must register and execute in both DuckDB ABIs.
+query I
+SELECT count(*) FROM 'test/data/test_data.lance';
+----
+5
+
+query I
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;
+----
+3
+
+# Exercise the shared C-string boundary without depending on Vane's Python API.
+statement error
+SELECT * FROM __lance_scan('dummy' || chr(0) || '.lance');
+----
+Invalid Input Error: Lance dataset path must not contain a NUL byte

@@ -945,6 +945,10 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
       if (lowered == "+" || lowered == "add" || lowered == "-" ||
           lowered == "subtract" || lowered == "*" || lowered == "multiply" ||
           lowered == "/" || lowered == "divide") {
+        if (!fn.children[0] || !fn.children[1]) {
+          throw InternalException(
+              "Lance UPDATE binary expression has null child");
+        }
         string lhs_ir, rhs_ir;
         EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
                              *fn.children[0], lhs_ir);
@@ -1024,6 +1028,10 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
   }
   case ExpressionClass::BOUND_COMPARISON: {
     auto &cmp = expr.Cast<BoundComparisonExpression>();
+    if (!cmp.left || !cmp.right) {
+      throw InternalException(
+          "Lance UPDATE comparison expression is malformed");
+    }
     string lhs_ir, rhs_ir;
     EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *cmp.left,
                          lhs_ir);
@@ -1085,6 +1093,9 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
   }
   case ExpressionClass::BOUND_BETWEEN: {
     auto &between = expr.Cast<BoundBetweenExpression>();
+    if (!between.input || !between.lower || !between.upper) {
+      throw InternalException("Lance UPDATE BETWEEN expression is malformed");
+    }
     string input_ir, lower_ir, upper_ir;
     EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *between.input,
                          input_ir);

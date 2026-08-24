@@ -2364,6 +2364,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "ffi_guard_macro"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3942,6 +3950,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "bzip2-sys",
  "chrono",
  "datafusion",
@@ -3949,6 +3958,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions",
  "datafusion-sql",
+ "ffi_guard_macro",
  "futures",
  "lance",
  "lance-arrow",
@@ -3957,11 +3967,16 @@ dependencies = [
  "lance-linalg",
  "lance-namespace",
  "lance-namespace-impls",
+ "lance-select",
  "lance-table",
+ "log",
+ "object_store",
+ "prost",
  "rand 0.8.7",
  "roaring",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snafu 0.8.9",
  "tokio",
 ]

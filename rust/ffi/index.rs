@@ -9,6 +9,7 @@ use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::vector::bq::validate_rq_num_bits;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::IndexType;
@@ -20,7 +21,8 @@ use crate::runtime;
 
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    canonicalize_lance_field_path, cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult,
+    canonicalize_lance_field_path, cstr_to_str, dataset_handle, ffi_output_string,
+    lance_mutation_error, to_c_string, FfiError, FfiResult,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,6 +41,7 @@ struct OptimizeIndexMetricsOutput {
     num_indices_to_merge: Option<usize>,
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_index_list_schema(dataset: *mut c_void) -> *mut c_void {
     match get_index_list_schema_inner(dataset) {
@@ -58,6 +61,7 @@ fn get_index_list_schema_inner(dataset: *mut c_void) -> FfiResult<SchemaHandle> 
     Ok(index_list_schema())
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_index_list_stream(dataset: *mut c_void) -> *mut c_void {
     match create_index_list_stream_inner(dataset) {
@@ -158,22 +162,29 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
 
 /// Returns an array of column names that have scalar indices.
 /// The caller must free the returned array with `lance_free_scalar_indexed_columns`.
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
     dataset: *mut c_void,
     out_len: *mut usize,
 ) -> *mut *mut c_char {
+    if out_len.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_len is null");
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::write_unaligned(out_len, 0);
+    }
     match list_scalar_indexed_columns_inner(dataset) {
         Ok(cols) => {
             clear_last_error();
-            unsafe { *out_len = cols.len() };
+            unsafe {
+                std::ptr::write_unaligned(out_len, cols.len());
+            }
             if cols.is_empty() {
                 return std::ptr::null_mut();
             }
-            let ptrs: Vec<*mut c_char> = cols
-                .into_iter()
-                .map(|s| to_c_string(s).into_raw())
-                .collect();
+            let ptrs: Vec<*mut c_char> = cols.into_iter().map(|s| s.into_raw()).collect();
             let mut boxed = ptrs.into_boxed_slice();
             let ptr = boxed.as_mut_ptr();
             std::mem::forget(boxed);
@@ -181,12 +192,12 @@ pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
         }
         Err(err) => {
             set_last_error(err.code, err.message);
-            unsafe { *out_len = 0 };
             std::ptr::null_mut()
         }
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_scalar_indexed_columns(ptr: *mut *mut c_char, len: usize) {
     if ptr.is_null() {
@@ -202,7 +213,7 @@ pub unsafe extern "C" fn lance_free_scalar_indexed_columns(ptr: *mut *mut c_char
     }
 }
 
-fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<String>> {
+fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<std::ffi::CString>> {
     let handle = unsafe { dataset_handle(dataset)? };
     let dataset = handle.dataset.as_ref().clone();
 
@@ -227,7 +238,11 @@ fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<Stri
         }
         for &field_id in d.field_ids() {
             if let Ok(path) = schema.field_path(field_id as i32) {
-                cols.push(path);
+                cols.push(ffi_output_string(
+                    path,
+                    ErrorCode::DatasetDescribeIndices,
+                    "scalar-indexed column path",
+                )?);
             }
         }
     }
@@ -280,6 +295,7 @@ fn estimate_rows_indexed(
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_create_index(
     dataset: *mut c_void,
@@ -388,15 +404,18 @@ fn dataset_create_index_inner(
             builder.replace(replace).train(train).await
         }) {
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => Err(FfiError::new(
+            Ok(Err(err)) => Err(lance_mutation_error(
                 ErrorCode::DatasetCreateIndex,
-                format!("dataset create_index: {err}"),
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                "dataset create_index",
+                err,
             )),
             Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
     })?
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_drop_index(
     dataset: *mut c_void,
@@ -427,14 +446,17 @@ fn dataset_drop_index_inner(dataset: *mut c_void, index_name: *const c_char) -> 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
     match runtime::block_on(async { ds.drop_index(index_name).await }) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(
+        Ok(Err(err)) => Err(lance_mutation_error(
             ErrorCode::DatasetDropIndex,
-            format!("dataset drop_index: {err}"),
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "dataset drop_index",
+            err,
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_optimize_index(
     dataset: *mut c_void,
@@ -459,6 +481,7 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     }
 }
 
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_optimize_index_with_options(
     dataset: *mut c_void,
@@ -589,9 +612,11 @@ fn dataset_optimize_index_with_options_inner(
                 retrain,
                 num_indices_to_merge,
             }),
-            Ok(Err(err)) => Err(FfiError::new(
+            Ok(Err(err)) => Err(lance_mutation_error(
                 ErrorCode::DatasetOptimizeIndices,
-                format!("dataset optimize_indices: {err}"),
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                "dataset optimize_indices",
+                err,
             )),
             Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
@@ -600,7 +625,7 @@ fn dataset_optimize_index_with_options_inner(
     if !out_metrics_json.is_null() {
         let payload = serde_json::to_string(&metrics).map_err(|err| {
             FfiError::new(
-                ErrorCode::DatasetOptimizeIndices,
+                ErrorCode::DatasetCommitOutcomeUnknown,
                 format!("optimize_index metrics_json serialize: {err}"),
             )
         })?;
@@ -686,6 +711,170 @@ fn is_vector_index_type(index_type: &str) -> bool {
     )
 }
 
+fn vector_string_param<'a>(
+    params: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: &'a str,
+) -> FfiResult<&'a str> {
+    match params.get(key) {
+        Some(value) => value.as_str().ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                format!("parameter '{key}' must be a string"),
+            )
+        }),
+        None => Ok(default),
+    }
+}
+
+fn vector_optional_u64_param(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> FfiResult<Option<u64>> {
+    params
+        .get(key)
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::DatasetCreateIndex,
+                    format!("parameter '{key}' must be a non-negative integer"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn vector_u64_param(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: u64,
+) -> FfiResult<u64> {
+    Ok(vector_optional_u64_param(params, key)?.unwrap_or(default))
+}
+
+fn vector_usize_param(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: u64,
+) -> FfiResult<usize> {
+    usize::try_from(vector_u64_param(params, key, default)?).map_err(|_| {
+        FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("parameter '{key}' is too large"),
+        )
+    })
+}
+
+fn vector_positive_usize_param(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: u64,
+) -> FfiResult<usize> {
+    let value = vector_usize_param(params, key, default)?;
+    if value == 0 {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("parameter '{key}' must be greater than zero"),
+        ));
+    }
+    Ok(value)
+}
+
+fn vector_num_bits_param(
+    params: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: u64,
+    supported: &[u8],
+) -> FfiResult<u8> {
+    let value = u8::try_from(vector_u64_param(params, key, default)?).map_err(|_| {
+        FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("parameter '{key}' is too large"),
+        )
+    })?;
+    if !supported.contains(&value) {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!(
+                "parameter '{key}' must be one of {}",
+                supported
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+fn apply_hnsw_params(
+    params: &serde_json::Map<String, serde_json::Value>,
+    hnsw: &mut HnswBuildParams,
+) -> FfiResult<()> {
+    if let Some(value) = vector_optional_u64_param(params, "hnsw_m")? {
+        hnsw.m = usize::try_from(value).map_err(|_| {
+            FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                "parameter 'hnsw_m' is too large",
+            )
+        })?;
+        if hnsw.m == 0 {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                "parameter 'hnsw_m' must be greater than zero",
+            ));
+        }
+    }
+    if let Some(value) = vector_optional_u64_param(params, "hnsw_ef_construction")? {
+        hnsw.ef_construction = usize::try_from(value).map_err(|_| {
+            FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                "parameter 'hnsw_ef_construction' is too large",
+            )
+        })?;
+        if hnsw.ef_construction == 0 {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                "parameter 'hnsw_ef_construction' must be greater than zero",
+            ));
+        }
+    }
+    if let Some(value) = vector_optional_u64_param(params, "hnsw_max_level")? {
+        hnsw.max_level = u16::try_from(value).map_err(|_| {
+            FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                "parameter 'hnsw_max_level' is too large",
+            )
+        })?;
+        if hnsw.max_level == 0 {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                "parameter 'hnsw_max_level' must be greater than zero",
+            ));
+        }
+    }
+    if let Some(value) = params.get("hnsw_prefetch_distance") {
+        hnsw.prefetch_distance = if value.is_null() {
+            None
+        } else {
+            let value = value.as_u64().ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::DatasetCreateIndex,
+                    "parameter 'hnsw_prefetch_distance' must be null or a non-negative integer",
+                )
+            })?;
+            Some(usize::try_from(value).map_err(|_| {
+                FfiError::new(
+                    ErrorCode::DatasetCreateIndex,
+                    "parameter 'hnsw_prefetch_distance' is too large",
+                )
+            })?)
+        };
+    }
+    Ok(())
+}
+
 fn build_vector_params(
     index_type: &str,
     params_json: Option<&str>,
@@ -708,38 +897,69 @@ fn build_vector_params(
         }
     }
 
-    let metric = params
-        .get("metric_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("l2");
+    let mut allowed_keys = vec!["metric_type", "version", "num_partitions"];
+    match index_type {
+        "IVF_FLAT" => {}
+        "IVF_PQ" => allowed_keys.extend(["num_bits", "num_sub_vectors", "max_iterations"]),
+        "IVF_RQ" => allowed_keys.push("num_bits"),
+        "IVF_SQ" => allowed_keys.extend(["num_bits", "sample_rate"]),
+        "IVF_HNSW_FLAT" => allowed_keys.extend([
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_max_level",
+            "hnsw_prefetch_distance",
+        ]),
+        "IVF_HNSW_PQ" => allowed_keys.extend([
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_max_level",
+            "hnsw_prefetch_distance",
+            "num_bits",
+            "num_sub_vectors",
+            "max_iterations",
+        ]),
+        "IVF_HNSW_SQ" => allowed_keys.extend([
+            "hnsw_m",
+            "hnsw_ef_construction",
+            "hnsw_max_level",
+            "hnsw_prefetch_distance",
+            "num_bits",
+            "sample_rate",
+        ]),
+        other => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                format!("unsupported vector index_type: {other}"),
+            ))
+        }
+    }
+    if let Some(unknown) = params
+        .keys()
+        .find(|key| !allowed_keys.contains(&key.as_str()))
+    {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("unknown parameter for {index_type}: {unknown}"),
+        ));
+    }
+
+    let metric = vector_string_param(&params, "metric_type", "l2")?;
     let metric_type = DistanceType::try_from(metric).map_err(|err| {
         FfiError::new(ErrorCode::DatasetCreateIndex, format!("metric_type: {err}"))
     })?;
 
-    let version = params
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("v3");
+    let version = vector_string_param(&params, "version", "v3")?;
     let version = IndexFileVersion::try_from(version)
         .map_err(|err| FfiError::new(ErrorCode::DatasetCreateIndex, format!("version: {err}")))?;
 
-    let num_partitions = params
-        .get("num_partitions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(256) as usize;
+    let num_partitions = vector_positive_usize_param(&params, "num_partitions", 256)?;
 
     let out = match index_type {
         "IVF_FLAT" => VectorIndexParams::ivf_flat(num_partitions, metric_type),
         "IVF_PQ" => {
-            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
-            let num_sub_vectors = params
-                .get("num_sub_vectors")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(16) as usize;
-            let max_iterations = params
-                .get("max_iterations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50) as usize;
+            let num_bits = vector_num_bits_param(&params, "num_bits", 8, &[4, 8])?;
+            let num_sub_vectors = vector_positive_usize_param(&params, "num_sub_vectors", 16)?;
+            let max_iterations = vector_positive_usize_param(&params, "max_iterations", 50)?;
             VectorIndexParams::ivf_pq(
                 num_partitions,
                 num_bits,
@@ -749,112 +969,67 @@ fn build_vector_params(
             )
         }
         "IVF_RQ" => {
-            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
+            let num_bits =
+                u8::try_from(vector_u64_param(&params, "num_bits", 8)?).map_err(|_| {
+                    FfiError::new(
+                        ErrorCode::DatasetCreateIndex,
+                        "parameter 'num_bits' is too large",
+                    )
+                })?;
+            validate_rq_num_bits(num_bits)
+                .map_err(|error| FfiError::new(ErrorCode::DatasetCreateIndex, error.to_string()))?;
             VectorIndexParams::ivf_rq(num_partitions, num_bits, metric_type)
         }
         "IVF_SQ" => {
-            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
+            let num_bits = u16::from(vector_num_bits_param(&params, "num_bits", 8, &[8])?);
             let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
             let sq = lance_index::vector::sq::builder::SQBuildParams {
-                num_bits: num_bits as u16,
-                sample_rate: params
-                    .get("sample_rate")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(256) as usize,
+                num_bits,
+                sample_rate: vector_positive_usize_param(&params, "sample_rate", 256)?,
             };
             VectorIndexParams::with_ivf_sq_params(metric_type, ivf, sq)
         }
         "IVF_HNSW_FLAT" => {
             let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
             let mut hnsw = HnswBuildParams::default();
-            if let Some(v) = params.get("hnsw_m").and_then(|v| v.as_u64()) {
-                hnsw.m = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_ef_construction").and_then(|v| v.as_u64()) {
-                hnsw.ef_construction = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_max_level").and_then(|v| v.as_u64()) {
-                hnsw.max_level = v as u16;
-            }
-            if let Some(v) = params.get("hnsw_prefetch_distance") {
-                if v.is_null() {
-                    hnsw.prefetch_distance = None;
-                } else if let Some(u) = v.as_u64() {
-                    hnsw.prefetch_distance = Some(u as usize);
-                }
-            }
+            apply_hnsw_params(&params, &mut hnsw)?;
             VectorIndexParams::ivf_hnsw(metric_type, ivf, hnsw)
         }
         "IVF_HNSW_PQ" => {
             let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
             let mut hnsw = HnswBuildParams::default();
-            if let Some(v) = params.get("hnsw_m").and_then(|v| v.as_u64()) {
-                hnsw.m = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_ef_construction").and_then(|v| v.as_u64()) {
-                hnsw.ef_construction = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_max_level").and_then(|v| v.as_u64()) {
-                hnsw.max_level = v as u16;
-            }
-            if let Some(v) = params.get("hnsw_prefetch_distance") {
-                if v.is_null() {
-                    hnsw.prefetch_distance = None;
-                } else if let Some(u) = v.as_u64() {
-                    hnsw.prefetch_distance = Some(u as usize);
-                }
-            }
+            apply_hnsw_params(&params, &mut hnsw)?;
 
             let mut pq = PQBuildParams::default();
-            if let Some(v) = params.get("num_bits").and_then(|v| v.as_u64()) {
-                pq.num_bits = v as usize;
+            if params.contains_key("num_bits") {
+                pq.num_bits = usize::from(vector_num_bits_param(&params, "num_bits", 8, &[4, 8])?);
             }
-            if let Some(v) = params.get("num_sub_vectors").and_then(|v| v.as_u64()) {
-                pq.num_sub_vectors = v as usize;
+            if params.contains_key("num_sub_vectors") {
+                pq.num_sub_vectors = vector_positive_usize_param(&params, "num_sub_vectors", 16)?;
             }
-            if let Some(v) = params.get("max_iterations").and_then(|v| v.as_u64()) {
-                pq.max_iters = v as usize;
+            if params.contains_key("max_iterations") {
+                pq.max_iters = vector_positive_usize_param(&params, "max_iterations", 50)?;
             }
             VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf, hnsw, pq)
         }
         "IVF_HNSW_SQ" => {
             let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
             let mut hnsw = HnswBuildParams::default();
-            if let Some(v) = params.get("hnsw_m").and_then(|v| v.as_u64()) {
-                hnsw.m = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_ef_construction").and_then(|v| v.as_u64()) {
-                hnsw.ef_construction = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_max_level").and_then(|v| v.as_u64()) {
-                hnsw.max_level = v as u16;
-            }
-            if let Some(v) = params.get("hnsw_prefetch_distance") {
-                if v.is_null() {
-                    hnsw.prefetch_distance = None;
-                } else if let Some(u) = v.as_u64() {
-                    hnsw.prefetch_distance = Some(u as usize);
-                }
-            }
+            apply_hnsw_params(&params, &mut hnsw)?;
 
             let mut sq = lance_index::vector::sq::builder::SQBuildParams {
                 num_bits: 8,
                 sample_rate: 256,
             };
-            if let Some(v) = params.get("num_bits").and_then(|v| v.as_u64()) {
-                sq.num_bits = v as u16;
+            if params.contains_key("num_bits") {
+                sq.num_bits = u16::from(vector_num_bits_param(&params, "num_bits", 8, &[8])?);
             }
-            if let Some(v) = params.get("sample_rate").and_then(|v| v.as_u64()) {
-                sq.sample_rate = v as usize;
+            if params.contains_key("sample_rate") {
+                sq.sample_rate = vector_positive_usize_param(&params, "sample_rate", 256)?;
             }
             VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf, hnsw, sq)
         }
-        other => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetCreateIndex,
-                format!("unsupported vector index_type: {other}"),
-            ))
-        }
+        _ => unreachable!("index type was validated above"),
     };
 
     let mut out = out;
@@ -872,9 +1047,12 @@ where
         .stack_size(STACK_SIZE)
         .spawn(f)
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("spawn: {err}")))?;
-    handle
-        .join()
-        .map_err(|_| FfiError::new(ErrorCode::Runtime, "thread panicked"))
+    handle.join().map_err(|_| {
+        FfiError::new(
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "index worker thread panicked; mutation outcome is unknown",
+        )
+    })
 }
 
 fn index_list_schema() -> SchemaHandle {
@@ -966,5 +1144,59 @@ mod tests {
         let err = canonicalize_lance_field_path(&schema, "value", "index column").unwrap_err();
 
         assert!(err.message.contains("index column not found"));
+    }
+
+    #[test]
+    fn rejects_invalid_vector_parameter_types_and_ranges() {
+        let error = match build_vector_params("IVF_FLAT", Some(r#"{"num_partition":4}"#)) {
+            Ok(_) => panic!("unknown num_partition unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("unknown parameter"));
+
+        let error = match build_vector_params("IVF_FLAT", Some(r#"{"num_partitions":"4"}"#)) {
+            Ok(_) => panic!("string num_partitions unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("non-negative integer"));
+
+        let error = match build_vector_params("IVF_PQ", Some(r#"{"num_bits":7}"#)) {
+            Ok(_) => panic!("out-of-range num_bits unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("num_bits"));
+
+        let error = match build_vector_params("IVF_RQ", Some(r#"{"num_bits":10}"#)) {
+            Ok(_) => panic!("out-of-range RQ num_bits unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("1..=9"));
+
+        let error = match build_vector_params("IVF_PQ", Some(r#"{"num_sub_vectors":0}"#)) {
+            Ok(_) => panic!("zero num_sub_vectors unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("greater than zero"));
+
+        let error = match build_vector_params(
+            "IVF_HNSW_FLAT",
+            Some(r#"{"hnsw_prefetch_distance":"near"}"#),
+        ) {
+            Ok(_) => panic!("string prefetch distance unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("null or a non-negative integer"));
+    }
+
+    #[test]
+    fn scalar_index_columns_rejects_null_length_output() {
+        let columns = unsafe {
+            lance_dataset_list_scalar_indexed_columns(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert!(columns.is_null());
+        assert_eq!(
+            crate::error::lance_last_error_code(),
+            ErrorCode::InvalidArgument as i32
+        );
     }
 }

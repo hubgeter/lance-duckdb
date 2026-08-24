@@ -12,11 +12,10 @@ Charlie
 Alice
 Eve
 
-# Duplicate row ids: output preserves duplicates
+# IN has set-membership semantics, so duplicate literals do not duplicate rows.
 query T
 SELECT name FROM 'test/data/test_data.lance' WHERE rowid IN (1, 1, 3)
 ----
-Bob
 Bob
 David
 

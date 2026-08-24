@@ -8,6 +8,18 @@ statement ok
 COPY (SELECT * FROM 'test/data/test_data.lance')
 TO 'test/.tmp/maintenance_auto_cleanup.lance' (FORMAT lance, mode 'overwrite');
 
+statement ok
+BEGIN;
+
+statement error
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance'
+SET AUTO_CLEANUP WITH (interval = 1, older_than = '1s');
+----
+Not implemented Error: Lance auto-cleanup configuration does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
 query TTT
 ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance' UNSET AUTO_CLEANUP;
 ----
@@ -17,6 +29,11 @@ query TT
 SHOW MAINTENANCE ON 'test/.tmp/maintenance_auto_cleanup.lance';
 ----
 enabled	false
+
+statement ok
+CREATE OR REPLACE TEMP TABLE auto_cleanup_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/maintenance_auto_cleanup.lance/_versions/*');
 
 query TTT
 ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance'
@@ -28,6 +45,12 @@ SET AUTO_CLEANUP WITH (
 ----
 set_auto_cleanup	test/.tmp/maintenance_auto_cleanup.lance	<REGEX>:\{.*"enabled":true.*"interval":1.*"older_than":"1s".*"retain_versions":2.*\}
 
+query I
+SELECT (SELECT c FROM auto_cleanup_versions) + 1 =
+       (SELECT count(*)::BIGINT FROM glob('test/.tmp/maintenance_auto_cleanup.lance/_versions/*'));
+----
+true
+
 query TT
 SHOW MAINTENANCE ON 'test/.tmp/maintenance_auto_cleanup.lance';
 ----
@@ -36,10 +59,21 @@ interval	1
 older_than	1s
 retain_versions	2
 
+statement ok
+CREATE OR REPLACE TEMP TABLE auto_cleanup_versions AS
+SELECT count(*)::BIGINT AS c
+FROM glob('test/.tmp/maintenance_auto_cleanup.lance/_versions/*');
+
 query TTT
 ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance' UNSET AUTO_CLEANUP;
 ----
 unset_auto_cleanup	test/.tmp/maintenance_auto_cleanup.lance	{"enabled":false}
+
+query I
+SELECT (SELECT c FROM auto_cleanup_versions) + 1 =
+       (SELECT count(*)::BIGINT FROM glob('test/.tmp/maintenance_auto_cleanup.lance/_versions/*'));
+----
+true
 
 query TT
 SHOW MAINTENANCE ON 'test/.tmp/maintenance_auto_cleanup.lance';

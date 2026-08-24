@@ -151,7 +151,7 @@ USING (
 ON t.id = src.id
 WHEN MATCHED THEN UPDATE SET s = src.s;
 ----
-2
+1
 
 query I
 SELECT count(*) FROM merge_ns.main.lance_merge_error_case;
@@ -177,7 +177,7 @@ USING (
 ON t.id = src.id
 WHEN MATCHED THEN DELETE;
 ----
-2
+1
 
 query I
 SELECT count(*) FROM merge_ns.main.lance_merge_duplicate_delete;

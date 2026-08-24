@@ -1,6 +1,7 @@
 title: DuckDB
 nav:
   - Overview: index.md
+  - Vane Integration: vane-integration.md
   - SQL Reference: sql.md
   - REST Namespace: rest.md
   - Cloud Storage: cloud.md

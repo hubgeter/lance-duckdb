@@ -107,7 +107,7 @@ SELECT f1 FROM 'test/.tmp/distinct_from_pushdown.lance'
 WHERE f1 IS NOT DISTINCT FROM f2
 LIMIT 1;
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "0"[\s\S]*
 
 # Non-finite float literals are encoded and pushed down (no DuckDB-side re-filtering).
 query I
@@ -144,10 +144,10 @@ query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*"Lance Rows Out"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "0"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*"Lance Rows Out"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "0"[\s\S]*

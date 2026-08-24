@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +17,9 @@ use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_arrow::RecordBatchExt;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::ROW_ID;
-use lance_table::format::RowIdMeta;
+use lance_select::RowAddrTreeMap;
+use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::rowids::{
     read_row_ids, rechunk_sequences, write_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence,
 };
@@ -29,7 +31,27 @@ use crate::filter_ir::parse_filter_ir;
 use crate::runtime;
 
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
+use super::write::{
+    cleanup_uncommitted_fragments, cleanup_uncommitted_transaction, VaneTransaction,
+};
 
+enum UpdatePreparation {
+    Ready(Option<Box<VaneTransaction>>, u64),
+    CleanupIncomplete(String),
+}
+
+enum UpdateStageError {
+    Regular(String),
+    CleanupIncomplete(String),
+}
+
+impl From<String> for UpdateStageError {
+    fn from(message: String) -> Self {
+        Self::Regular(message)
+    }
+}
+
+#[ffi_guard_macro::ffi_guard(dataset_mutation)]
 #[no_mangle]
 pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage_options(
     path: *const c_char,
@@ -146,6 +168,16 @@ fn rewrite_rows_update_transaction_inner(
             "out_rows_updated is null",
         ));
     }
+    if super::util::output_regions_overlap(out_transaction, out_rows_updated) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_transaction and out_rows_updated must not overlap",
+        ));
+    }
+    unsafe {
+        std::ptr::write_unaligned(out_transaction, std::ptr::null_mut());
+        std::ptr::write_unaligned(out_rows_updated, 0);
+    }
 
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
     let predicate_ir = if predicate_ir.is_null() {
@@ -215,6 +247,7 @@ fn rewrite_rows_update_transaction_inner(
 
     let mut set_columns_vec = Vec::with_capacity(set_len);
     let mut set_expr_ir_vec = Vec::with_capacity(set_len);
+    let mut seen_set_columns = BTreeSet::new();
     for (idx, ((&col_ptr, &expr_ir_ptr), &expr_ir_len)) in set_cols_slice
         .iter()
         .zip(set_expr_ir_ptrs.iter())
@@ -237,6 +270,12 @@ fn rewrite_rows_update_transaction_inner(
         let col = unsafe { CStr::from_ptr(col_ptr) }.to_str().map_err(|err| {
             FfiError::new(ErrorCode::Utf8, format!("set_columns[{idx}] utf8: {err}"))
         })?;
+        if !seen_set_columns.insert(col.to_string()) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("duplicate SET column: {col}"),
+            ));
+        }
         let expr_ir =
             unsafe { slice_from_ptr(expr_ir_ptr, expr_ir_len, "set_expr_ir_item")? }.to_vec();
         set_columns_vec.push(col.to_string());
@@ -272,7 +311,7 @@ fn rewrite_rows_update_transaction_inner(
 
     let (maybe_txn, rows_updated) = match runtime::block_on(async {
         let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
-            .with_storage_options(storage_options);
+            .with_storage_options(storage_options.clone());
         if let Some(session) = session.clone() {
             builder = builder.with_session(session);
         }
@@ -293,17 +332,18 @@ fn rewrite_rows_update_transaction_inner(
             HashMap::<String, Arc<dyn datafusion::physical_expr::PhysicalExpr>>::new();
 
         for (column, value_ir) in set_columns_vec.iter().zip(set_expr_ir_vec.iter()) {
-            if column.contains('.') {
-                return Err(format!(
-                    "nested column references are not supported: {}",
-                    column
-                ));
-            }
-
             let field = dataset
                 .schema()
-                .field(column.as_str())
-                .ok_or_else(|| format!("column does not exist: {}", column))?;
+                .fields
+                .iter()
+                .find(|field| field.name == *column)
+                .ok_or_else(|| {
+                    if dataset.schema().field(column.as_str()).is_some() {
+                        format!("nested column references are not supported: {column}")
+                    } else {
+                        format!("column does not exist: {column}")
+                    }
+                })?;
 
             let mut value_expr =
                 parse_expr_ir(value_ir, Some(&session_ctx)).map_err(|e| e.to_string())?;
@@ -339,7 +379,7 @@ fn rewrite_rows_update_transaction_inner(
         let input_schema = input_stream.schema();
         let first_batch = input_stream.try_next().await.map_err(|e| e.to_string())?;
         let Some(first_batch) = first_batch else {
-            return Ok::<_, String>((None, 0));
+            return Ok::<_, String>(UpdatePreparation::Ready(None, 0));
         };
 
         let base_stream = futures::stream::iter(Some(Ok(first_batch)))
@@ -362,7 +402,14 @@ fn rewrite_rows_update_transaction_inner(
                 // Capture row ids for later deletion and stable row id preservation.
                 // For non-stable row ids, these are row addresses (RowAddress as u64).
                 // For stable row ids, these are stable row ids (requiring a RowIdIndex to map).
-                captured_row_ids_ref.lock().unwrap().capture(row_ids)?;
+                captured_row_ids_ref
+                    .lock()
+                    .map_err(|_| {
+                        DataFusionError::Execution(
+                            "UPDATE row-id collector lock was poisoned".to_string(),
+                        )
+                    })?
+                    .capture(row_ids)?;
 
                 let mut batch = batch
                     .drop_column(ROW_ID)
@@ -397,85 +444,246 @@ fn rewrite_rows_update_transaction_inner(
             ..Default::default()
         };
 
-        let append_txn = InsertBuilder::new(dataset.clone())
+        let append_txn = match InsertBuilder::new(dataset.clone())
             .with_params(&write_params)
             .execute_uncommitted_stream(updated_stream)
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                // The streaming writer does not return the paths it created on
+                // failure, so a late batch/write error cannot prove that no
+                // unreferenced files remain.
+                return Ok(UpdatePreparation::CleanupIncomplete(format!(
+                    "UPDATE uncommitted write failed and may have left orphan files: {error}"
+                )));
+            }
+        };
 
-        let captured_row_ids = captured_row_ids.lock().unwrap().clone();
+        let captured_row_ids = match captured_row_ids.lock() {
+            Ok(captured_row_ids) => captured_row_ids.clone(),
+            Err(_) => {
+                let message = "UPDATE row-id collector lock was poisoned".to_string();
+                return match cleanup_uncommitted_transaction(
+                    &path,
+                    &storage_options,
+                    session.clone(),
+                    &append_txn,
+                )
+                .await
+                {
+                    Ok(()) => Err(message),
+                    Err(cleanup_error) => Ok(UpdatePreparation::CleanupIncomplete(format!(
+                        "{message}, and orphan cleanup failed: {cleanup_error}"
+                    ))),
+                };
+            }
+        };
         let rows_updated = captured_row_ids.len();
 
-        let Operation::Append { fragments } = append_txn.operation else {
-            return Err("unexpected transaction operation for update write".to_string());
+        let fragments = match &append_txn.operation {
+            Operation::Append { fragments } => fragments.clone(),
+            _ => {
+                let message = "unexpected transaction operation for update write".to_string();
+                return match cleanup_uncommitted_transaction(
+                    &path,
+                    &storage_options,
+                    session.clone(),
+                    &append_txn,
+                )
+                .await
+                {
+                    Ok(()) => Err(message),
+                    Err(cleanup_error) => Ok(UpdatePreparation::CleanupIncomplete(format!(
+                        "{message}, and orphan cleanup failed: {cleanup_error}"
+                    ))),
+                };
+            }
         };
 
-        let mut new_fragments = fragments;
+        let new_fragments = fragments;
+        let mut cleanup_fragments = new_fragments.clone();
 
-        if stable_row_ids {
-            let CapturedRowIds::SequenceStyle(sequence) = &captured_row_ids else {
-                return Err(
-                    "stable row ids enabled but captured row ids are not sequence style"
-                        .to_string(),
-                );
+        let finish_result = async {
+            let mut new_fragments = new_fragments;
+
+            if stable_row_ids {
+                let CapturedRowIds::SequenceStyle(sequence) = &captured_row_ids else {
+                    return Err(UpdateStageError::Regular(
+                        "stable row ids enabled but captured row ids are not sequence style"
+                            .to_string(),
+                    ));
+                };
+
+                let fragment_sizes = new_fragments
+                    .iter()
+                    .map(|fragment| {
+                        fragment.physical_rows.ok_or_else(|| {
+                            "UPDATE produced a fragment with an unknown row count".to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let fragment_sizes = fragment_sizes
+                    .into_iter()
+                    .map(|rows| {
+                        u64::try_from(rows).map_err(|_| {
+                            "UPDATE fragment row count does not fit in u64".to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let written_rows = fragment_sizes.iter().try_fold(0_u64, |total, rows| {
+                    total
+                        .checked_add(*rows)
+                        .ok_or_else(|| "UPDATE fragment row count overflow".to_string())
+                })?;
+                if written_rows != rows_updated {
+                    return Err(UpdateStageError::Regular(format!(
+                    "UPDATE wrote {written_rows} rows but captured {rows_updated} stable row IDs"
+                )));
+                }
+                let sequences = rechunk_sequences(vec![sequence.clone()], fragment_sizes, false)
+                    .map_err(|e| e.to_string())?;
+                if sequences.len() != new_fragments.len() {
+                    return Err(UpdateStageError::Regular(
+                        "UPDATE stable row-id rechunking did not match output fragments"
+                            .to_string(),
+                    ));
+                }
+                for (fragment, seq) in new_fragments.iter_mut().zip(sequences) {
+                    fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq)));
+                }
+            }
+
+            let row_addrs = match &captured_row_ids {
+                CapturedRowIds::AddressStyle(addrs) => addrs.clone(),
+                CapturedRowIds::SequenceStyle(sequence) => {
+                    let row_id_index = build_row_id_index(dataset.as_ref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mut addrs = RoaringTreemap::new();
+                    for row_id in sequence.iter() {
+                        let addr = row_id_index
+                            .get(row_id)
+                            .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
+                        addrs.insert(u64::from(addr));
+                    }
+                    addrs
+                }
             };
 
-            let fragment_sizes = new_fragments
-                .iter()
-                .map(|f| f.physical_rows.unwrap_or_default() as u64);
-            let sequences = rechunk_sequences(vec![sequence.clone()], fragment_sizes, false)
-                .map_err(|e| e.to_string())?;
-            for (fragment, seq) in new_fragments.iter_mut().zip(sequences) {
-                fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq)));
-            }
-        }
-
-        let row_addrs = match &captured_row_ids {
-            CapturedRowIds::AddressStyle(addrs) => addrs.clone(),
-            CapturedRowIds::SequenceStyle(sequence) => {
-                let row_id_index = build_row_id_index(dataset.as_ref())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let mut addrs = RoaringTreemap::new();
-                for row_id in sequence.iter() {
-                    let addr = row_id_index
-                        .get(row_id)
-                        .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
-                    addrs.insert(u64::from(addr));
+            fn collect_modified_field_ids(
+                field: &lance_core::datatypes::Field,
+                column_name: &str,
+                out: &mut Vec<u32>,
+            ) -> Result<(), String> {
+                out.push(u32::try_from(field.id).map_err(|_| {
+                    format!(
+                        "UPDATE column '{column_name}' has an invalid field id {}",
+                        field.id
+                    )
+                })?);
+                for child in &field.children {
+                    collect_modified_field_ids(child, column_name, out)?;
                 }
-                addrs
+                Ok(())
             }
-        };
 
-        let (updated_fragments, removed_fragment_ids) =
-            apply_deletions(dataset.as_ref(), &row_addrs)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut fields_for_preserving_frag_bitmap = Vec::new();
+            for column_name in set_columns_vec.iter() {
+                let field = dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *column_name)
+                    .ok_or_else(|| {
+                        format!("UPDATE column '{column_name}' is not in the dataset schema")
+                    })?;
+                collect_modified_field_ids(
+                    field,
+                    column_name,
+                    &mut fields_for_preserving_frag_bitmap,
+                )?;
+            }
+            fields_for_preserving_frag_bitmap.sort_unstable();
+            fields_for_preserving_frag_bitmap.dedup();
 
-        let mut fields_for_preserving_frag_bitmap = Vec::new();
-        for column_name in set_columns_vec.iter() {
-            if let Ok(field_id) = dataset.schema().field_id(column_name.as_str()) {
-                fields_for_preserving_frag_bitmap.push(field_id as u32);
+            // Validate every schema-derived field id before writing deletion
+            // files.  Once apply_deletions succeeds there must be no fallible
+            // preparation left that could strand those files outside the
+            // transaction returned to the caller.
+            let (updated_fragments, removed_fragment_ids) =
+                apply_deletions(dataset.as_ref(), &row_addrs)
+                    .await
+                    .map_err(|error| {
+                        if error.cleanup_incomplete {
+                            UpdateStageError::CleanupIncomplete(error.message)
+                        } else {
+                            UpdateStageError::Regular(error.message)
+                        }
+                    })?;
+            // Deletion files are written before the transaction is returned.
+            // Include the resulting fragments in the fallback cleanup set so
+            // a later allocation/transaction-construction failure cannot
+            // strand those files outside the manifest.
+            cleanup_fragments.extend(updated_fragments.iter().cloned());
+
+            let operation = Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified: vec![],
+                merged_generations: Vec::new(),
+                fields_for_preserving_frag_bitmap,
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            };
+
+            let txn = VaneTransaction::with_affected_rows(
+                Transaction::new(dataset.manifest.version, operation, None),
+                RowAddrTreeMap::from(row_addrs),
+            );
+
+            Ok::<_, UpdateStageError>((txn, rows_updated))
+        }
+        .await;
+
+        match finish_result {
+            Ok((txn, rows_updated)) => {
+                Ok(UpdatePreparation::Ready(Some(Box::new(txn)), rows_updated))
+            }
+            Err(stage_error) => {
+                let (message, already_incomplete) = match stage_error {
+                    UpdateStageError::Regular(message) => (message, false),
+                    UpdateStageError::CleanupIncomplete(message) => (message, true),
+                };
+                let cleanup_result = cleanup_uncommitted_fragments(
+                    &path,
+                    &storage_options,
+                    session,
+                    &cleanup_fragments,
+                    Some(dataset.manifest.version),
+                )
+                .await;
+                match (already_incomplete, cleanup_result) {
+                    (false, Ok(())) => Err(message),
+                    (_, Ok(())) => Ok(UpdatePreparation::CleanupIncomplete(message)),
+                    (_, Err(cleanup_error)) => {
+                        Ok(UpdatePreparation::CleanupIncomplete(format!(
+                            "UPDATE preparation failed after writing uncommitted fragments ({message}), and orphan cleanup failed: {cleanup_error}"
+                        )))
+                    }
+                }
             }
         }
-
-        let operation = Operation::Update {
-            removed_fragment_ids,
-            updated_fragments,
-            new_fragments,
-            fields_modified: vec![],
-            merged_generations: Vec::new(),
-            fields_for_preserving_frag_bitmap,
-            update_mode: Some(UpdateMode::RewriteRows),
-            inserted_rows_filter: None,
-            updated_fragment_offsets: None,
-        };
-
-        let txn = Transaction::new(dataset.manifest.version, operation, None);
-
-        Ok::<_, String>((Some(txn), rows_updated))
     }) {
-        Ok(Ok(v)) => v,
+        Ok(Ok(UpdatePreparation::Ready(maybe_txn, rows_updated))) => (maybe_txn, rows_updated),
+        Ok(Ok(UpdatePreparation::CleanupIncomplete(message))) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCommitOutcomeUnknown,
+                message,
+            ))
+        }
         Ok(Err(message)) => return Err(FfiError::new(ErrorCode::DatasetUpdateOverwrite, message)),
         Err(err) => {
             return Err(FfiError::new(
@@ -486,12 +694,9 @@ fn rewrite_rows_update_transaction_inner(
     };
 
     unsafe {
-        *out_rows_updated = rows_updated;
+        std::ptr::write_unaligned(out_rows_updated, rows_updated);
         if let Some(txn) = maybe_txn {
-            let boxed = Box::new(txn);
-            *out_transaction = Box::into_raw(boxed) as *mut c_void;
-        } else {
-            *out_transaction = std::ptr::null_mut();
+            std::ptr::write_unaligned(out_transaction, Box::into_raw(txn) as *mut c_void);
         }
     };
 
@@ -520,12 +725,29 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
             RowIdMeta::Inline(data) => data.clone(),
             RowIdMeta::External(file) => {
                 let path = base.clone().join(file.path.as_str());
-                let range = file.offset as usize..(file.offset + file.size) as usize;
+                let end = file.offset.checked_add(file.size).ok_or_else(|| {
+                    format!(
+                        "row-id metadata range overflows for fragment {}",
+                        fragment.id
+                    )
+                })?;
+                let start = usize::try_from(file.offset).map_err(|_| {
+                    format!(
+                        "row-id metadata offset does not fit in usize for fragment {}",
+                        fragment.id
+                    )
+                })?;
+                let end = usize::try_from(end).map_err(|_| {
+                    format!(
+                        "row-id metadata end does not fit in usize for fragment {}",
+                        fragment.id
+                    )
+                })?;
                 object_store
                     .open(&path)
                     .await
                     .map_err(|e| e.to_string())?
-                    .get_range(range)
+                    .get_range(start..end)
                     .await
                     .map_err(|e| e.to_string())?
                     .to_vec()
@@ -533,9 +755,13 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
         };
 
         let sequence = read_row_ids(&row_id_bytes).map_err(|e| e.to_string())?;
+        let fragment_id = u32::try_from(fragment.id)
+            .map_err(|_| format!("fragment id {} does not fit in a row address", fragment.id))?;
+        let dataset_fragment_id = usize::try_from(fragment.id)
+            .map_err(|_| format!("fragment id {} does not fit in usize", fragment.id))?;
         let deletion_vector = fragments
             .iter()
-            .find(|f| f.id() as u32 == fragment.id as u32)
+            .find(|candidate| candidate.id() == dataset_fragment_id)
             .ok_or_else(|| "fragment missing from dataset fragments".to_string())?
             .get_deletion_vector()
             .await
@@ -543,7 +769,7 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
             .unwrap_or_else(|| Arc::new(DeletionVector::default()));
 
         indices.push(FragmentRowIdIndex {
-            fragment_id: fragment.id as u32,
+            fragment_id,
             row_id_sequence: Arc::new(sequence),
             deletion_vector,
         });
@@ -555,27 +781,135 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
 pub(super) async fn apply_deletions(
     dataset: &lance::Dataset,
     row_addrs: &RoaringTreemap,
-) -> Result<(Vec<lance_table::format::Fragment>, Vec<u64>), String> {
+) -> Result<(Vec<Fragment>, Vec<u64>), DeletionApplyError> {
     let bitmaps: BTreeMap<u32, _> = row_addrs.bitmaps().collect();
 
     let mut updated_fragments = Vec::new();
     let mut removed_fragment_ids = Vec::new();
-
+    let mut fragments_by_id = BTreeMap::new();
     for fragment in dataset.get_fragments() {
-        let fragment_id = fragment.id() as u32;
-        let Some(bitmap) = bitmaps.get(&fragment_id) else {
-            continue;
-        };
+        let fragment_id = u32::try_from(fragment.id()).map_err(|_| {
+            DeletionApplyError::regular(format!(
+                "fragment id {} does not fit in a row address",
+                fragment.id()
+            ))
+        })?;
+        fragments_by_id.insert(fragment_id, fragment);
+    }
 
-        match fragment
-            .extend_deletions(bitmap.iter())
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            Some(new_fragment) => updated_fragments.push(new_fragment.metadata().clone()),
-            None => removed_fragment_ids.push(fragment_id as u64),
+    let missing = bitmaps
+        .keys()
+        .filter(|fragment_id| !fragments_by_id.contains_key(fragment_id))
+        .map(u32::to_string)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(DeletionApplyError::regular(format!(
+            "row addresses reference fragment(s) missing from pinned dataset version: {}",
+            missing.join(", ")
+        )));
+    }
+
+    for (fragment_id, bitmap) in bitmaps {
+        let fragment = fragments_by_id
+            .remove(&fragment_id)
+            .expect("fragment IDs were validated before writing deletion files");
+        let change = fragment.extend_deletions(bitmap.iter()).await;
+        match change {
+            Ok(Some(new_fragment)) => updated_fragments.push(new_fragment.metadata().clone()),
+            Ok(None) => removed_fragment_ids.push(u64::from(fragment_id)),
+            Err(error) => {
+                let message = error.to_string();
+                return match cleanup_uncommitted_deletion_files(dataset, &updated_fragments).await {
+                    Ok(()) => Err(DeletionApplyError::cleanup_incomplete(format!(
+                        "applying Lance deletions failed ({message}); the failing deletion-file write may have created an orphan whose path was not returned"
+                    ))),
+                    Err(cleanup_error) => Err(DeletionApplyError::cleanup_incomplete(format!(
+                        "applying Lance deletions failed ({message}), and partial deletion-file cleanup failed: {cleanup_error}"
+                    ))),
+                };
+            }
         }
     }
 
     Ok((updated_fragments, removed_fragment_ids))
+}
+
+#[derive(Debug)]
+pub(super) struct DeletionApplyError {
+    pub(super) message: String,
+    pub(super) cleanup_incomplete: bool,
+}
+
+impl DeletionApplyError {
+    fn regular(message: String) -> Self {
+        Self {
+            message,
+            cleanup_incomplete: false,
+        }
+    }
+
+    fn cleanup_incomplete(message: String) -> Self {
+        Self {
+            message,
+            cleanup_incomplete: true,
+        }
+    }
+}
+
+impl std::fmt::Display for DeletionApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+async fn cleanup_uncommitted_deletion_files(
+    dataset: &lance::Dataset,
+    fragments: &[Fragment],
+) -> Result<(), String> {
+    for fragment in fragments {
+        let Some(deletion_file) = fragment.deletion_file.as_ref() else {
+            continue;
+        };
+        let already_referenced = dataset
+            .manifest()
+            .fragments
+            .iter()
+            .find(|current| current.id == fragment.id)
+            .and_then(|current| current.deletion_file.as_ref())
+            == Some(deletion_file);
+        if already_referenced {
+            continue;
+        }
+
+        let store = dataset
+            .object_store(deletion_file.base_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let base = match deletion_file.base_id {
+            Some(base_id) => {
+                let base_path =
+                    dataset.manifest().base_paths.get(&base_id).ok_or_else(|| {
+                        format!("deletion-file base id {base_id} is not registered")
+                    })?;
+                if !base_path.is_dataset_root {
+                    return Err(format!(
+                        "deletion-file base id {base_id} is not a dataset root"
+                    ));
+                }
+                base_path
+                    .extract_path(dataset.session().store_registry())
+                    .map_err(|error| error.to_string())?
+            }
+            None => dataset.branch_location().path,
+        };
+        let relative = relative_deletion_file_path(fragment.id, deletion_file);
+        let object = base.join(relative.as_str());
+        match store.delete(&object).await {
+            Ok(()) => {}
+            Err(error) if error.is_not_found() => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    Ok(())
 }

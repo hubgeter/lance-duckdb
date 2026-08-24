@@ -10,10 +10,11 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr, to_c_string,
-    FfiError, FfiResult,
+    cstr_to_str, nonzero_u64_to_usize, optional_cstr_to_string, parse_optional_filter_ir,
+    slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_knn_schema(
     dataset: *mut c_void,
@@ -100,6 +101,7 @@ fn get_knn_schema_inner(
     Ok(schema)
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_knn_stream_ir(
     dataset: *mut c_void,
@@ -111,6 +113,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    filter_sql: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> *mut c_void {
@@ -124,6 +127,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         refine_factor,
         filter_ir,
         filter_ir_len,
+        filter_sql,
         prefilter,
         use_index,
     ) {
@@ -149,6 +153,7 @@ fn create_knn_stream_ir_inner(
     refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    filter_sql: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<StreamHandle> {
@@ -168,6 +173,7 @@ fn create_knn_stream_ir_inner(
             "knn filter_ir",
         )?
     };
+    let filter_sql = unsafe { optional_cstr_to_string(filter_sql, "knn filter_sql")? };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
@@ -175,7 +181,21 @@ fn create_knn_stream_ir_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    if let Some(filter_sql) = filter_sql.as_deref() {
+        scan.filter(filter_sql).map_err(|err| {
+            FfiError::new(ErrorCode::KnnStreamCreate, format!("knn filter_sql: {err}"))
+        })?;
+    }
     if let Some(filter) = filter {
+        let filter = match scan.get_expr_filter().map_err(|err| {
+            FfiError::new(
+                ErrorCode::KnnStreamCreate,
+                format!("knn filter_sql parse: {err}"),
+            )
+        })? {
+            Some(sql_filter) => sql_filter.and(filter),
+            None => filter,
+        };
         scan.filter_expr(filter);
     }
     let query = Float32Array::from_iter_values(query_values.iter().copied());
@@ -215,6 +235,7 @@ fn create_knn_stream_ir_inner(
     Ok(StreamHandle::Lance(stream))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     dataset: *mut c_void,

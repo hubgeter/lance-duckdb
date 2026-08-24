@@ -22,6 +22,7 @@
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
+#include "lance_lease.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
@@ -30,29 +31,6 @@
 #include <cstdint>
 
 namespace duckdb {
-
-static vector<pair<string, string>> ParseLanceMetadataRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance field metadata" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
 
 static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                                         LanceTableEntry &table,
@@ -67,8 +45,15 @@ static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
                       display_uri + LanceFormatErrorSuffix());
   }
 
-  auto rows = ParseLanceMetadataRows(
-      lance_dataset_list_field_metadata(dataset, field_name.c_str()));
+  vector<pair<string, string>> rows;
+  try {
+    rows = ParseLanceKeyValueRows(
+        lance_dataset_list_field_metadata(dataset, field_name.c_str()),
+        "Lance field metadata");
+  } catch (...) {
+    lance_close_dataset(dataset);
+    throw;
+  }
   lance_close_dataset(dataset);
 
   for (auto &entry : rows) {
@@ -195,6 +180,8 @@ public:
     }
     state.emitted = true;
 
+    RequireLanceMutationSlot(context.client, table.catalog);
+
     if (set_columns.size() != set_expr_irs.size()) {
       throw InternalException("Lance UPDATE has mismatched SET columns/values");
     }
@@ -205,6 +192,10 @@ public:
     string display_uri;
     ResolveLanceStorageOptionsForTable(context.client, table, open_path,
                                        option_keys, option_values, display_uri);
+    auto cache_key = LanceBuildDatasetCacheKeyForTable(context.client, table);
+    auto mutation_lease = LanceLease::Acquire(
+        context.client, open_path, LanceLeaseKind::Mutation,
+        "update:" + display_uri, option_keys, option_values);
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
@@ -218,6 +209,7 @@ public:
     set_expr_ir_ptrs.reserve(set_expr_irs.size());
     set_expr_ir_lens.reserve(set_expr_irs.size());
     for (idx_t i = 0; i < set_columns.size(); i++) {
+      ValidateLanceCString(set_columns[i], "Lance UPDATE column");
       set_col_ptrs.push_back(set_columns[i].c_str());
       set_expr_ir_ptrs.push_back(
           reinterpret_cast<const uint8_t *>(set_expr_irs[i].data()));
@@ -255,10 +247,10 @@ public:
       return SourceResultType::FINISHED;
     }
 
-    RegisterLancePendingAppend(
-        context.client, table.catalog, std::move(open_path),
-        std::move(option_keys), std::move(option_values),
-        LanceBuildDatasetCacheKeyForTable(context.client, table), txn);
+    RegisterLancePendingAppend(context.client, table.catalog,
+                               std::move(open_path), std::move(option_keys),
+                               std::move(option_values), std::move(cache_key),
+                               txn, std::move(mutation_lease));
 
     state.rows_updated = rows_updated;
 
@@ -316,6 +308,10 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
   if (!scan_bind) {
     throw InternalException("Lance UPDATE is missing Lance scan bind data");
   }
+  // The target scan is part of the same mutation.  Its pinned generation is
+  // still carried in the bind data, but it must not acquire a conflicting
+  // snapshot lease before the update sink acquires the mutation lease.
+  scan_bind->mutation_scan = true;
 
   vector<string> predicate_ir_parts;
   if (!parts.get->table_filters.filters.empty() &&

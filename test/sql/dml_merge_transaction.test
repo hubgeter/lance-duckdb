@@ -38,6 +38,13 @@ WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s);
 ----
 2
 
+# DuckDB cannot atomically publish two independent Lance transactions from one
+# explicit transaction. Reject the second mutation before it writes files.
+statement error
+INSERT INTO merge_txn_ns.main.lance_merge_txn VALUES (4::BIGINT, 'd'::VARCHAR);
+----
+TransactionContext Error: A DuckDB transaction may contain at most one Lance mutation
+
 statement ok
 ROLLBACK;
 
@@ -85,6 +92,28 @@ SELECT ((SELECT c FROM merge_txn_versions) + 1) =
 ----
 true
 
+# Match DuckDB's first-match behavior when duplicate source rows target the
+# same row: mutate, count, and return the target only once.
+query TIT
+MERGE INTO merge_txn_ns.main.lance_merge_txn AS t
+USING (
+  SELECT 2::BIGINT AS id, 'once'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'once'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+RETURNING merge_action, t.id, t.s;
+----
+UPDATE	2	once
+
+query IT
+SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
+----
+1	a
+2	once
+3	c
+
 statement ok
 BEGIN TRANSACTION;
 
@@ -99,11 +128,20 @@ WHEN NOT MATCHED THEN DO NOTHING;
 statement ok
 COMMIT;
 
+# The committed update+insert MERGE and the duplicate-source MERGE each create
+# one Lance version. The final no-op MERGE must not create another version.
 query T
-SELECT ((SELECT c FROM merge_txn_versions) + 1) =
+SELECT ((SELECT c FROM merge_txn_versions) + 2) =
        (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
 ----
 true
+
+# Lance reserves dots in top-level field names for nested field paths.
+statement error
+CREATE OR REPLACE TABLE merge_txn_ns.main.lance_merge_dotted
+  (id BIGINT, "payload.value" VARCHAR);
+----
+IO Error: Failed to finalize Lance dataset write
 
 statement ok
 DETACH merge_txn_ns;

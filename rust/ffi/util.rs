@@ -27,7 +27,140 @@ impl FfiError {
     }
 }
 
+/// Convert an error returned by a Lance operation that may have crossed its
+/// manifest-commit point.  Semantic and conflict errors are definitive: the
+/// requested mutation did not commit.  Transport, timeout, internal, wrapped,
+/// and cleanup errors cannot prove that, so callers must retain their mutation
+/// lease and reconcile the dataset before retrying.
+pub(crate) fn lance_mutation_outcome_unknown(error: &lance::Error) -> bool {
+    // Keep this match exhaustive.  A newly introduced Lance error variant must
+    // be classified deliberately instead of silently becoming retryable.
+    match error {
+        lance::Error::InvalidInput { .. }
+        | lance::Error::DatasetAlreadyExists { .. }
+        | lance::Error::SchemaMismatch { .. }
+        | lance::Error::DatasetNotFound { .. }
+        | lance::Error::NotSupported { .. }
+        | lance::Error::CommitConflict { .. }
+        | lance::Error::IncompatibleTransaction { .. }
+        | lance::Error::RetryableCommitConflict { .. }
+        | lance::Error::TooMuchWriteContention { .. }
+        | lance::Error::Unprocessable { .. }
+        | lance::Error::Arrow { .. }
+        | lance::Error::Schema { .. }
+        | lance::Error::IndexNotFound { .. }
+        | lance::Error::InvalidTableLocation { .. }
+        | lance::Error::Stop
+        | lance::Error::Execution { .. }
+        | lance::Error::InvalidRef { .. }
+        | lance::Error::RefConflict { .. }
+        | lance::Error::RefNotFound { .. }
+        | lance::Error::VersionNotFound { .. }
+        | lance::Error::VersionConflict { .. }
+        | lance::Error::FieldNotFound { .. }
+        | lance::Error::DiskCapExceeded { .. } => false,
+        lance::Error::CorruptFile { .. }
+        | lance::Error::Timeout { .. }
+        | lance::Error::Internal { .. }
+        | lance::Error::PrerequisiteFailed { .. }
+        | lance::Error::NotFound { .. }
+        | lance::Error::IO { .. }
+        | lance::Error::Index { .. }
+        | lance::Error::Wrapped { .. }
+        | lance::Error::Cloned { .. }
+        | lance::Error::Cleanup { .. }
+        | lance::Error::Namespace { .. }
+        | lance::Error::External { .. }
+        | lance::Error::Fenced { .. } => true,
+    }
+}
+
+pub(crate) fn lance_mutation_error(
+    definitive_code: ErrorCode,
+    outcome_unknown_code: ErrorCode,
+    operation: &str,
+    error: lance::Error,
+) -> FfiError {
+    FfiError::new(
+        if lance_mutation_outcome_unknown(&error) {
+            outcome_unknown_code
+        } else {
+            definitive_code
+        },
+        format!("{operation}: {error}"),
+    )
+}
+
 pub(crate) type FfiResult<T> = Result<T, FfiError>;
+
+pub(crate) fn output_regions_overlap<T, U>(left: *mut T, right: *mut U) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+    let left_start = left as usize;
+    let right_start = right as usize;
+    let Some(left_end) = left_start.checked_add(std::mem::size_of::<T>()) else {
+        return true;
+    };
+    let Some(right_end) = right_start.checked_add(std::mem::size_of::<U>()) else {
+        return true;
+    };
+    left_start < right_end && right_start < left_end
+}
+
+fn is_http_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+pub(crate) fn parse_headers_tsv(headers_tsv: Option<&str>) -> FfiResult<Vec<(String, String)>> {
+    let Some(headers_tsv) = headers_tsv else {
+        return Ok(Vec::new());
+    };
+
+    headers_tsv
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            let (name, value) = line.split_once('\t').ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("headers_tsv line {line_number} must contain one tab separator"),
+                )
+            })?;
+            if name.is_empty() || !name.bytes().all(is_http_header_name_byte) {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("headers_tsv line {line_number} has an invalid HTTP header name"),
+                ));
+            }
+            if value.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("headers_tsv line {line_number} has an invalid HTTP header value"),
+                ));
+            }
+            Ok((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
 
 pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
     match CString::new(s.as_ref()) {
@@ -35,6 +168,49 @@ pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
         Err(_) => CString::new(s.as_ref().replace('\0', "\\0"))
             .unwrap_or_else(|_| CString::new("invalid string").unwrap()),
     }
+}
+
+pub(crate) fn ffi_output_string(
+    value: impl Into<Vec<u8>>,
+    code: ErrorCode,
+    what: &str,
+) -> FfiResult<CString> {
+    CString::new(value).map_err(|_| {
+        FfiError::new(
+            code,
+            format!("{what} contains a NUL byte and cannot cross the C ABI"),
+        )
+    })
+}
+
+pub(crate) fn push_ffi_key_value_row(output: &mut String, key: &str, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, field) in [key, value].into_iter().enumerate() {
+        for byte in field.as_bytes() {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        if index == 0 {
+            output.push('\t');
+        }
+    }
+    output.push('\n');
+}
+
+pub(crate) fn join_ffi_lines(values: &[String], code: ErrorCode, what: &str) -> FfiResult<String> {
+    for value in values {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+        {
+            return Err(FfiError::new(
+                code,
+                format!("{what} contains an empty or unrepresentable table name"),
+            ));
+        }
+    }
+    Ok(values.join("\n"))
 }
 
 pub(crate) fn canonicalize_lance_field_path(
@@ -77,6 +253,16 @@ pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> 
         .context("utf8 decode")
         .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("{what} utf8: {err}")))?;
     Ok(s)
+}
+
+pub(crate) unsafe fn optional_cstr_to_string(
+    ptr: *const c_char,
+    what: &'static str,
+) -> FfiResult<Option<String>> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(unsafe { cstr_to_str(ptr, what)? }.to_string()))
 }
 
 pub(crate) unsafe fn slice_from_ptr<'a, T>(
@@ -226,4 +412,116 @@ pub(crate) fn schema_to_ffi_arrow_schema(
     let data_type = arrow::datatypes::DataType::Struct(schema.fields().clone());
     arrow::ffi::FFI_ArrowSchema::try_from(&data_type)
         .map_err(|err| FfiError::new(ErrorCode::SchemaExport, format!("schema export: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        join_ffi_lines, lance_mutation_error, output_regions_overlap, parse_headers_tsv,
+        push_ffi_key_value_row,
+    };
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn parses_valid_headers_tsv() {
+        assert_eq!(
+            parse_headers_tsv(Some("x-api-key\tsecret\nx-empty\t")).unwrap(),
+            vec![
+                ("x-api-key".to_string(), "secret".to_string()),
+                ("x-empty".to_string(), String::new()),
+            ]
+        );
+        assert!(parse_headers_tsv(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsafe_headers_tsv() {
+        for headers in [
+            "missing-separator",
+            "\tvalue",
+            "bad name\tvalue",
+            "name\tvalue\textra",
+            "name\tvalue\rwith-control",
+        ] {
+            assert!(
+                parse_headers_tsv(Some(headers)).is_err(),
+                "expected invalid header TSV to fail: {headers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_transport_rejects_empty_nul_and_newline_names() {
+        for name in ["", "nul\0name", "line\nbreak", "carriage\rreturn"] {
+            let error = join_ffi_lines(
+                &[name.to_string()],
+                ErrorCode::NamespaceListTables,
+                "namespace list_tables response",
+            )
+            .unwrap_err();
+            assert_eq!(error.code as i32, ErrorCode::NamespaceListTables as i32);
+            assert!(error.message.contains("empty or unrepresentable"));
+        }
+        assert_eq!(
+            join_ffi_lines(
+                &["one".to_string(), "two".to_string()],
+                ErrorCode::NamespaceListTables,
+                "namespace list_tables response",
+            )
+            .unwrap(),
+            "one\ntwo"
+        );
+    }
+
+    #[test]
+    fn key_value_transport_encodes_all_utf8_bytes_without_delimiter_collisions() {
+        let mut output = String::new();
+        push_ffi_key_value_row(&mut output, "same\t\n\0", "same\t\n\0");
+        push_ffi_key_value_row(&mut output, "雪", "");
+        assert_eq!(output, "73616d65090a00\t73616d65090a00\ne99baa\t\n");
+    }
+
+    #[test]
+    fn mutation_errors_distinguish_definitive_failures_from_unknown_outcomes() {
+        let definitive = lance_mutation_error(
+            ErrorCode::DatasetAddColumns,
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "add columns",
+            lance::Error::invalid_input("bad expression"),
+        );
+        assert_eq!(definitive.code as i32, ErrorCode::DatasetAddColumns as i32);
+
+        let unknown = lance_mutation_error(
+            ErrorCode::DatasetAddColumns,
+            ErrorCode::DatasetCommitOutcomeUnknown,
+            "add columns",
+            lance::Error::timeout("commit acknowledgement"),
+        );
+        assert_eq!(
+            unknown.code as i32,
+            ErrorCode::DatasetCommitOutcomeUnknown as i32
+        );
+    }
+
+    #[test]
+    fn output_region_validation_rejects_exact_and_partial_aliases() {
+        let mut storage = [0_u8; 32];
+        let start = storage.as_mut_ptr();
+        assert!(output_regions_overlap(
+            start.cast::<u64>(),
+            start.cast::<usize>()
+        ));
+        assert!(output_regions_overlap(
+            start.cast::<u64>(),
+            unsafe { start.add(4) }.cast::<usize>()
+        ));
+        assert!(!output_regions_overlap(
+            start.cast::<u64>(),
+            unsafe { start.add(8) }.cast::<usize>()
+        ));
+        assert!(!output_regions_overlap(
+            std::ptr::null_mut::<u64>(),
+            start.cast::<usize>()
+        ));
+    }
 }

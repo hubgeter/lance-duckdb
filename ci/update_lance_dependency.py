@@ -26,6 +26,7 @@ LANCE_CRATES = (
     "lance-linalg",
     "lance-namespace",
     "lance-namespace-impls",
+    "lance-select",
     "lance-table",
 )
 

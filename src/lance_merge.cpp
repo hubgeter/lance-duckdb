@@ -4,6 +4,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -11,12 +12,14 @@
 #include "duckdb/planner/expression/bound_default_expression.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
+#include "lance_lease.hpp"
 #include "lance_merge.hpp"
+#include "lance_scan_bind_data.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
@@ -170,18 +173,50 @@ static void AddInsertChunkToMergeHandle(void *merge_handle, DataChunk &chunk,
       extension_type_cast;
   auto props = context.GetClientProperties();
 
-  ArrowArray array;
-  memset(&array, 0, sizeof(array));
-  ArrowConverter::ToArrowArray(chunk, &array, props, extension_type_cast);
+  ArrowArrayWrapper array;
+  ArrowConverter::ToArrowArray(chunk, &array.arrow_array, props,
+                               extension_type_cast);
 
-  auto rc = lance_merge_add_insert_batch(merge_handle,
-                                         reinterpret_cast<void *>(&array));
-  if (array.release) {
-    array.release(&array);
-  }
+  auto rc = lance_merge_add_insert_batch(merge_handle, &array.arrow_array);
 
   if (rc != 0) {
     throw IOException("Failed to add MERGE insert batch to Lance transaction" +
+                      LanceFormatErrorSuffix());
+  }
+}
+
+static void AddUpdateChunkToMergeHandle(void *merge_handle, DataChunk &chunk,
+                                        const uint64_t *row_ids,
+                                        idx_t row_ids_len,
+                                        const vector<string> &modified_columns,
+                                        ClientContext &context) {
+  if (chunk.size() == 0) {
+    return;
+  }
+  if (!row_ids || row_ids_len != chunk.size()) {
+    throw InternalException(
+        "Lance MERGE update row IDs do not match the update batch");
+  }
+
+  unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
+      extension_type_cast;
+  auto props = context.GetClientProperties();
+  ArrowArrayWrapper array;
+  ArrowConverter::ToArrowArray(chunk, &array.arrow_array, props,
+                               extension_type_cast);
+
+  vector<const char *> modified_column_ptrs;
+  modified_column_ptrs.reserve(modified_columns.size());
+  for (const auto &column : modified_columns) {
+    ValidateLanceCString(column, "Lance MERGE update column");
+    modified_column_ptrs.push_back(column.c_str());
+  }
+  auto rc = lance_merge_add_update_batch(
+      merge_handle, &array.arrow_array, row_ids, row_ids_len,
+      modified_column_ptrs.empty() ? nullptr : modified_column_ptrs.data(),
+      modified_column_ptrs.size());
+  if (rc != 0) {
+    throw IOException("Failed to add MERGE update batch to Lance transaction" +
                       LanceFormatErrorSuffix());
   }
 }
@@ -207,9 +242,34 @@ static void ConvertArrowArrayToDuckDataChunk(ClientContext &context,
                                     true, DConstants::INVALID_INDEX);
 }
 
-struct MergeTakeBatch {
-  DataChunk chunk;
-  idx_t row_offset = 0;
+class LanceMergeStreamHandle final {
+public:
+  explicit LanceMergeStreamHandle(void *stream_p) : stream(stream_p) {}
+  ~LanceMergeStreamHandle() {
+    if (stream) {
+      lance_close_stream(stream);
+    }
+  }
+
+  void *Get() const { return stream; }
+
+private:
+  void *stream;
+};
+
+class LanceMergeBatchHandle final {
+public:
+  ~LanceMergeBatchHandle() {
+    if (batch) {
+      lance_free_batch(batch);
+    }
+  }
+
+  void **Out() { return &batch; }
+  void *Get() const { return batch; }
+
+private:
+  void *batch = nullptr;
 };
 
 class PhysicalLanceMergeInto;
@@ -238,8 +298,10 @@ public:
 
   string display_uri;
   string open_path;
+  string cache_key;
   vector<string> option_keys;
   vector<string> option_values;
+  unique_ptr<LanceLease> mutation_lease;
 
   void *merge_handle = nullptr;
   void *take_dataset = nullptr;
@@ -303,14 +365,16 @@ public:
                          vector<unique_ptr<LanceMergeAction>> actions_p,
                          vector<LanceMergeActionRange> action_ranges_p,
                          idx_t row_id_index_p, optional_idx source_marker_p,
-                         bool return_chunk_p, idx_t estimated_cardinality)
+                         bool return_chunk_p, uint64_t dataset_version_p,
+                         idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
         table(table_p), table_column_names(std::move(table_column_names_p)),
         table_column_types(std::move(table_column_types_p)),
         actions(std::move(actions_p)),
         action_ranges(std::move(action_ranges_p)), row_id_index(row_id_index_p),
-        source_marker(source_marker_p), return_chunk(return_chunk_p) {}
+        source_marker(source_marker_p), return_chunk(return_chunk_p),
+        dataset_version(dataset_version_p) {}
 
   bool IsSink() const override { return true; }
   bool IsSource() const override { return true; }
@@ -318,6 +382,7 @@ public:
 
   unique_ptr<GlobalSinkState>
   GetGlobalSinkState(ClientContext &context) const override {
+    RequireLanceMutationSlot(context, table.catalog);
     return make_uniq<LanceMergeGlobalState>(context, *this);
   }
 
@@ -404,6 +469,7 @@ public:
   idx_t row_id_index;
   optional_idx source_marker;
   bool return_chunk;
+  uint64_t dataset_version;
 };
 
 LanceMergeGlobalState::LanceMergeGlobalState(ClientContext &context_p,
@@ -432,6 +498,10 @@ void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
 
   ResolveLanceStorageOptionsForTable(context, op.table, open_path, option_keys,
                                      option_values, display_uri);
+  cache_key = LanceBuildDatasetCacheKeyForTable(context, op.table);
+  mutation_lease =
+      LanceLease::Acquire(context, open_path, LanceLeaseKind::Mutation,
+                          "merge:" + display_uri, option_keys, option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
@@ -443,7 +513,7 @@ void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
       LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context),
-      &merge_handle);
+      op.dataset_version, &merge_handle);
   if (rc != 0 || !merge_handle) {
     throw IOException("Failed to start Lance MERGE transaction for '" +
                       open_path + "'" + LanceFormatErrorSuffix());
@@ -459,6 +529,15 @@ void LanceMergeGlobalState::EnsureTakeDataset(ClientContext &context) {
   if (!take_dataset) {
     throw IOException("Failed to open Lance dataset for MERGE row fetch: " +
                       display_uri + LanceFormatErrorSuffix());
+  }
+  auto *pinned_dataset =
+      lance_dataset_checkout_version(take_dataset, op.dataset_version);
+  lance_close_dataset(take_dataset);
+  take_dataset = pinned_dataset;
+  if (!take_dataset) {
+    throw IOException(
+        "Failed to pin Lance dataset version " + to_string(op.dataset_version) +
+        " for MERGE row fetch: " + display_uri + LanceFormatErrorSuffix());
   }
 }
 
@@ -487,61 +566,52 @@ void LanceMergeGlobalState::ForEachTakenChunk(ClientContext &context,
   vector<const char *> column_ptrs;
   column_ptrs.reserve(op.table_column_names.size());
   for (auto &name : op.table_column_names) {
+    ValidateLanceCString(name, "Lance MERGE result column");
     column_ptrs.push_back(name.c_str());
   }
 
-  auto *stream = lance_create_dataset_take_stream_unfiltered(
+  LanceMergeStreamHandle stream(lance_create_dataset_take_stream_unfiltered(
       take_dataset, row_ids.data(), row_ids.size(),
-      column_ptrs.empty() ? nullptr : column_ptrs.data(), column_ptrs.size());
-  if (!stream) {
+      column_ptrs.empty() ? nullptr : column_ptrs.data(), column_ptrs.size()));
+  if (!stream.Get()) {
     throw IOException("Failed to create Lance take stream for MERGE" +
                       LanceFormatErrorSuffix());
   }
 
   idx_t taken_rows = 0;
   while (true) {
-    void *batch = nullptr;
-    auto rc = lance_stream_next(stream, &batch);
+    LanceMergeBatchHandle batch;
+    auto rc = lance_stream_next(stream.Get(), batch.Out());
     if (rc == 1) {
       break;
     }
     if (rc != 0) {
-      lance_close_stream(stream);
       throw IOException("Failed to read Lance take stream for MERGE" +
                         LanceFormatErrorSuffix());
     }
 
     auto arrow_chunk = make_uniq<ArrowArrayWrapper>();
-    memset(&arrow_chunk->arrow_array, 0, sizeof(arrow_chunk->arrow_array));
-    ArrowSchema schema;
-    memset(&schema, 0, sizeof(schema));
+    ArrowSchemaWrapper schema;
 
-    if (lance_batch_to_arrow(batch, &arrow_chunk->arrow_array, &schema) != 0) {
-      lance_free_batch(batch);
-      lance_close_stream(stream);
+    if (lance_batch_to_arrow(batch.Get(), &arrow_chunk->arrow_array,
+                             &schema.arrow_schema) != 0) {
       throw IOException("Failed to export Lance MERGE take batch to Arrow" +
                         LanceFormatErrorSuffix());
     }
-    lance_free_batch(batch);
 
     // Widen Float16 columns to Float32 so PopulateArrowTableSchema and
     // DuckDB consumers see a supported type.
-    LanceCoerceArrowArrayForDuckDB(&schema, &arrow_chunk->arrow_array);
-    LanceCoerceArrowSchemaForDuckDB(&schema);
+    LanceCoerceArrowArrayForDuckDB(&schema.arrow_schema,
+                                   &arrow_chunk->arrow_array);
+    LanceCoerceArrowSchemaForDuckDB(&schema.arrow_schema);
 
     DataChunk taken;
-    ConvertArrowArrayToDuckDataChunk(context, *arrow_chunk, schema, taken,
-                                     op.table_column_types);
-
-    if (schema.release) {
-      schema.release(&schema);
-    }
+    ConvertArrowArrayToDuckDataChunk(context, *arrow_chunk, schema.arrow_schema,
+                                     taken, op.table_column_types);
 
     fn(taken, taken_rows);
     taken_rows += taken.size();
   }
-
-  lance_close_stream(stream);
 
   if (taken_rows != row_ids.size()) {
     throw IOException("Lance MERGE take returned unexpected row count: " +
@@ -647,35 +717,6 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
     throw ConstraintException(rowid_error);
   }
 
-  if (return_chunk) {
-    gstate.ForEachTakenChunk(
-        context.client, row_ids, [&](DataChunk &taken, idx_t row_offset) {
-          DataChunk patched;
-          patched.Initialize(context.client, table_column_types);
-          patched.SetCardinality(taken.size());
-          for (idx_t c = 0; c < table_column_types.size(); c++) {
-            patched.data[c].Reference(taken.data[c]);
-          }
-          for (idx_t update_col_idx = 0;
-               update_col_idx < action.update_columns.size();
-               update_col_idx++) {
-            auto physical_col_idx = action.update_columns[update_col_idx].index;
-            if (physical_col_idx >= patched.ColumnCount()) {
-              throw InternalException(
-                  "Lance MERGE UPDATE target column index is out of range");
-            }
-            for (idx_t row_idx = 0; row_idx < taken.size(); row_idx++) {
-              auto update_row_idx = row_offset + row_idx;
-              patched.SetValue(
-                  physical_col_idx, row_idx,
-                  update_values.data[update_col_idx].GetValue(update_row_idx));
-            }
-          }
-          AppendMergeReturningRows(context.client, gstate.return_collection,
-                                   patched, "UPDATE");
-        });
-  }
-
   vector<uint64_t> unique_row_ids;
   vector<idx_t> unique_input_idxs;
   unique_row_ids.reserve(row_ids.size());
@@ -689,7 +730,6 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
   }
 
   if (unique_row_ids.empty()) {
-    gstate.changed_rows += input_chunk.size();
     return;
   }
 
@@ -725,11 +765,21 @@ void PhysicalLanceMergeInto::HandleMergeUpdateRows(
           }
         }
 
-        AddInsertChunkToMergeHandle(gstate.merge_handle, patched,
-                                    context.client);
+        if (row_offset > unique_row_ids.size() ||
+            taken.size() > unique_row_ids.size() - row_offset) {
+          throw InternalException(
+              "Lance MERGE UPDATE row-id slice is out of range");
+        }
+        AddUpdateChunkToMergeHandle(
+            gstate.merge_handle, patched, unique_row_ids.data() + row_offset,
+            taken.size(), action.update_column_names, context.client);
+        if (return_chunk) {
+          AppendMergeReturningRows(context.client, gstate.return_collection,
+                                   patched, "UPDATE");
+        }
       });
 
-  gstate.changed_rows += input_chunk.size();
+  gstate.changed_rows += unique_row_ids.size();
 }
 
 void PhysicalLanceMergeInto::HandleMergeInsertRows(
@@ -771,7 +821,6 @@ void PhysicalLanceMergeInto::HandleMergeDeleteRows(
   }
 
   if (unique_row_ids.empty()) {
-    gstate.changed_rows += input_chunk.size();
     return;
   }
 
@@ -785,7 +834,7 @@ void PhysicalLanceMergeInto::HandleMergeDeleteRows(
 
   gstate.EnsureMergeHandle(context.client);
   gstate.AddDeleteRowIds(unique_row_ids);
-  gstate.changed_rows += input_chunk.size();
+  gstate.changed_rows += unique_row_ids.size();
 }
 
 void PhysicalLanceMergeInto::HandleMergeErrorRows(
@@ -973,7 +1022,7 @@ PhysicalLanceMergeInto::Finalize(Pipeline &, Event &, ClientContext &context,
   RegisterLancePendingAppend(
       context, table.catalog, std::move(gstate.open_path),
       std::move(gstate.option_keys), std::move(gstate.option_values),
-      LanceBuildDatasetCacheKeyForTable(context, table), txn);
+      std::move(gstate.cache_key), txn, std::move(gstate.mutation_lease));
   return SinkFinalizeType::READY;
 }
 
@@ -1001,6 +1050,34 @@ PhysicalLanceMergeInto::GetDataInternal(ExecutionContext &, DataChunk &chunk,
   return SourceResultType::HAVE_MORE_OUTPUT;
 }
 
+static void FindLanceMergeTargetVersion(PhysicalOperator &physical_op,
+                                        const TableCatalogEntry &target_table,
+                                        uint64_t &dataset_version) {
+  if (physical_op.type == PhysicalOperatorType::TABLE_SCAN) {
+    auto &scan = physical_op.Cast<PhysicalTableScan>();
+    auto *scan_bind = dynamic_cast<LanceScanBindData *>(scan.bind_data.get());
+    if (scan_bind && scan_bind->table_entry.get() == &target_table) {
+      if (scan_bind->dataset_version == 0) {
+        throw InternalException(
+            "Lance MERGE target scan is missing its pinned dataset version");
+      }
+      if (dataset_version != 0 &&
+          dataset_version != scan_bind->dataset_version) {
+        throw InternalException(
+            "Lance MERGE target scans resolved different dataset versions");
+      }
+      dataset_version = scan_bind->dataset_version;
+      // MERGE acquires one mutation lease for the target.  The target scan is
+      // therefore covered by that lease and must not acquire a conflicting
+      // snapshot lease of its own.
+      scan_bind->mutation_scan = true;
+    }
+  }
+  for (const auto &child : physical_op.children) {
+    FindLanceMergeTargetVersion(child.get(), target_table, dataset_version);
+  }
+}
+
 PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
                                      PhysicalPlanGenerator &planner,
                                      LogicalMergeInto &op,
@@ -1021,6 +1098,14 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
 
   if (op.children.empty() || !op.children[0]) {
     throw InternalException("Lance MERGE expects a child plan");
+  }
+
+  uint64_t dataset_version = 0;
+  FindLanceMergeTargetVersion(plan, op.table, dataset_version);
+  if (dataset_version == 0) {
+    throw InternalException(
+        "Lance MERGE could not resolve the target scan's pinned dataset "
+        "version");
   }
 
   map<MergeActionCondition, vector<unique_ptr<LanceMergeAction>>>
@@ -1109,7 +1194,7 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
       op.types, *lance_table, std::move(table_column_names),
       std::move(table_column_types), std::move(flat_actions),
       std::move(action_ranges), op.row_id_start, op.source_marker,
-      op.return_chunk, op.estimated_cardinality);
+      op.return_chunk, dataset_version, op.estimated_cardinality);
   merge.children.push_back(plan);
   (void)context;
   return merge;

@@ -242,6 +242,7 @@ async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFra
     df.sort(sort_exprs).map_err(|e| e.to_string())
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_exec_schema(
     dataset: *mut c_void,
@@ -280,6 +281,7 @@ fn get_exec_schema_inner(
     Ok(Arc::new(Schema::new(schema.fields().clone())))
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_dataset_exec_stream_ir(
     dataset: *mut c_void,

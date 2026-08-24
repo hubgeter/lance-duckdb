@@ -8,13 +8,74 @@ statement ok
 COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/nsroot_create_table_125/attach_create_table_seed.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
+COPY (SELECT 6::BIGINT AS id) TO 'test/.tmp/nsroot_create_table_125/CasePreserved.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
 ATTACH 'test/.tmp/nsroot_create_table_125' AS ns (TYPE LANCE);
+
+query I
+SELECT sum(id) FROM ns.main.casepreserved;
+----
+6
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.casepreserved AS SELECT 7::BIGINT AS id;
+
+query I
+SELECT sum(id) FROM 'test/.tmp/nsroot_create_table_125/CasePreserved.lance';
+----
+7
+
+query I
+SELECT count(*) FROM glob('test/.tmp/nsroot_create_table_125/casepreserved.lance/**');
+----
+0
+
+statement ok
+DROP TABLE ns.main.CASEPRESERVED;
+
+query I
+SELECT count(*) FROM glob('test/.tmp/nsroot_create_table_125/CasePreserved.lance/**');
+----
+0
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_empty (id BIGINT, s VARCHAR);
 
 query I
 SELECT count(*) FROM ns.main.attach_create_table_empty
+----
+0
+
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE ns.main.explicit_txn_create (id BIGINT);
+----
+Not implemented Error: Lance DDL does not support explicit transactions yet
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM glob('test/.tmp/nsroot_create_table_125/explicit_txn_create.lance/**');
+----
+0
+
+statement ok
+BEGIN;
+
+statement error
+DROP TABLE ns.main.attach_create_table_empty;
+----
+Not implemented Error: Lance DDL does not support explicit transactions yet
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ns.main.attach_create_table_empty;
 ----
 0
 
@@ -107,6 +168,15 @@ attach_create_table_ctas_with_version
 attach_create_table_empty
 attach_create_table_seed
 attach_create_table_with_version
+
+statement ok
+CREATE TABLE ns.main.attach_create_table_ctas_after_show AS
+  SELECT 42::BIGINT AS id;
+
+query I
+SELECT id FROM ns.main.attach_create_table_ctas_after_show
+----
+42
 
 statement ok
 CREATE TABLE ns.main.attach_create_table_after_show (id BIGINT);

@@ -5,6 +5,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
 use super::util::{stream_handle_mut, FfiError, FfiResult};
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_stream_next(
     stream: *mut c_void,
@@ -50,6 +51,7 @@ fn stream_next_inner(stream: *mut c_void, out_batch: *mut *mut c_void) -> FfiRes
     }
 }
 
+#[ffi_guard_macro::ffi_guard]
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_stream(stream: *mut c_void) {
     if !stream.is_null() {

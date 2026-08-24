@@ -14,6 +14,8 @@
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
+#include "lance_lease.hpp"
+#include "lance_scan_bind_data.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
@@ -87,6 +89,14 @@ static bool TryBuildLanceDeleteFilterIR(LogicalDelete &op,
     out_error = "unsupported DELETE plan: missing LogicalGet";
     return false;
   }
+  auto *scan_bind = dynamic_cast<LanceScanBindData *>(get->bind_data.get());
+  if (!scan_bind) {
+    out_error = "unsupported DELETE plan: missing Lance scan bind data";
+    return false;
+  }
+  // DELETE holds the mutation lease in its source operator.  Do not let the
+  // target scan try to take a second, conflicting snapshot lease.
+  scan_bind->mutation_scan = true;
 
   vector<string> names;
   vector<LogicalType> types;
@@ -167,12 +177,18 @@ public:
     }
     state.emitted = true;
 
+    RequireLanceMutationSlot(context.client, table.catalog);
+
     string open_path;
     vector<string> option_keys;
     vector<string> option_values;
     string display_uri;
     ResolveLanceStorageOptionsForTable(context.client, table, open_path,
                                        option_keys, option_values, display_uri);
+    auto cache_key = LanceBuildDatasetCacheKeyForTable(context.client, table);
+    auto mutation_lease = LanceLease::Acquire(
+        context.client, open_path, LanceLeaseKind::Mutation,
+        "delete:" + display_uri, option_keys, option_values);
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
@@ -200,22 +216,11 @@ public:
                           "': null transaction returned for non-zero deleted "
                           "rows");
       }
-    } else if (context.client.transaction.IsAutoCommit()) {
-      rc = lance_commit_transaction_with_storage_options(
-          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-          LanceGetSessionHandle(context.client), txn);
-      if (rc != 0) {
-        throw IOException("Failed to commit Lance DELETE transaction for '" +
-                          open_path + "'" + LanceFormatErrorSuffix());
-      }
-      LanceInvalidateDatasetCacheForTable(context.client, table);
     } else {
-      auto cache_key = LanceBuildDatasetCacheKeyForTable(context.client, table);
       RegisterLancePendingAppend(context.client, table.catalog,
                                  std::move(open_path), std::move(option_keys),
                                  std::move(option_values), std::move(cache_key),
-                                 txn);
+                                 txn, std::move(mutation_lease));
     }
 
     chunk.SetCardinality(1);
